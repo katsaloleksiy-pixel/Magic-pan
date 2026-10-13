@@ -1,0 +1,14 @@
+# Монтажёр: бот + свой сервер Telegram Bot API (для файлов больше 20 МБ) + ffmpeg
+# На Railway укажите переменную RAILWAY_DOCKERFILE_PATH=Magic pan-Dockerfile
+FROM aiogram/telegram-bot-api:latest
+
+USER root
+RUN apk add --no-cache nodejs ffmpeg && node -v && ffmpeg -version | head -n 1
+
+WORKDIR /app
+COPY ["Magic pan-server.js", "./"]
+
+ENV NODE_ENV=production
+# Сервер Bot API запускает сам бот, поэтому стандартная точка входа образа не нужна
+ENTRYPOINT []
+CMD ["node", "Magic pan-server.js"]
