@@ -1350,7 +1350,8 @@ function sourceLine(src) {
   }
   if (src.fps >= 47) parts.push(`${Math.round(src.fps)} fps — можно замедлять`);
   else if (src.fps && Math.round(src.fps) !== 30 && src.kind === 'video') parts.push(`${Math.round(src.fps)} fps`);
-  return `${src.aiError ? '⚠️' : '✅'} ${parts.join(' · ')}`;
+  if (role === 'broll' && !ai.shots && !src.aiError) parts.push('принят, разберу после этапа 2');
+  return `${src.aiError ? '⚠️' : ai.shots || ai.phrases ? '✅' : '📥'} ${parts.join(' · ')}`;
 }
 
 async function processSource(user, chatId, m) {
@@ -1394,6 +1395,8 @@ async function processSource(user, chatId, m) {
     p.sources.push(src);
     dropInbox(user, m);
     await saveUser(user);
+    // Перебивки этапа 2 пока только принимаем: ИИ разберёт их, когда этап закончится
+    if (src.role === 'broll' && stageOf(p) === 'broll') return void (await st.done(sourceLine(src)));
     // Разбор ИИ идёт параллельно: очередь сразу берёт следующий файл
     await say(`⏳ Исходник ${n}: жду очереди к ИИ…`);
     background(user, chatId, () =>
@@ -1431,17 +1434,131 @@ async function aiSlot(fn) {
   }
 }
 
-const stageBtn = (p) => (p.stage === 'broll' ? ['🎤 Дальше — речь', 'st_talk'] : ['🎞 Дальше — перебивки', 'st_broll']);
-const montageKb = (p) => kb([[['🎬 Смонтировать', 'm_go'], ['🗑 Очистить', 'm_clear']], [stageBtn(p)]]);
-const stageLine = (p) => (p.stage === 'broll' ? '🎞 Сейчас принимаю <b>перебивки</b>: речь в них не разбираю.' : '🎤 Сейчас принимаю <b>видео с речью</b>: речь разбираю. Перебивки — нажмите «Дальше — перебивки» или /broll.');
+// ── Мастер нового ролика: 4 этапа ──
+const STAGE_NO = { talk: 1, broll: 2, brief: 3, ready: 4 };
+const STAGE_NAME = { talk: 'Речь', broll: 'Перебивки', brief: 'Пожелания', ready: 'Монтаж' };
+const stageOf = (p) => (p && STAGE_NO[p.stage] ? p.stage : 'talk');
+const stageDots = (n) => [1, 2, 3, 4].map((i) => (i < n ? '✅' : i === n ? '🔵' : '⚪')).join('');
+const stageLine = (p) => `${stageDots(STAGE_NO[stageOf(p)])} Сейчас: <b>этап ${STAGE_NO[stageOf(p)]} из 4 · ${STAGE_NAME[stageOf(p)]}</b>`;
 
-/** Сменить этап загрузки: что считать присланные дальше видео */
+function stageKb(p) {
+  const st = stageOf(p);
+  if (st === 'talk') return kb([[['➡️ Дальше: перебивки', 'st_broll']]]);
+  if (st === 'broll') return kb([[['➡️ Дальше: пожелания', 'st_brief']], [['⬅️ Назад: речь', 'st_talk']]]);
+  if (st === 'brief') return kb([[p.brief.length ? ['➡️ Дальше: монтаж', 'st_ready'] : ['🎨 На выбор ИИ', 'st_ready']], [['⬅️ Назад: перебивки', 'st_broll']]]);
+  return kb([[['▶️ Смонтировать', 'm_run']], [['✍️ Пожелания', 'st_brief'], ['➕ Ещё файлы', 'st_talk']], [['🗑 Начать заново', 'm_clear']]]);
+}
+const montageKb = stageKb;
+
+function introText(user, p, extra = '') {
+  const warn = user.passport && !user.passport.confirmed ? '\n\n⚠️ Паспорт стиля ещё не подтверждён — монтирую по текущей версии.' : '';
+  return `🎬 <b>Режим монтажа · Ролик №${p.id}</b>
+
+Соберём ролик за 4 этапа. На каждом я скажу, что прислать, и дам кнопку «Дальше»:
+
+1️⃣ <b>Речь</b> — видео, где вы говорите в камеру, и/или голосовое сообщение с закадровым текстом
+2️⃣ <b>Перебивки</b> — видео для картинки: продукт, процесс, место. Речь в них не слушаю
+3️⃣ <b>Пожелания</b> — коротко, каким должен быть ролик, или «на выбор ИИ»
+4️⃣ <b>Монтаж и правки</b> — покажу цену, смонтирую, правки пишете текстом
+
+Этапы можно пропускать: например, только голосовое + перебивки или только видео с речью.${extra ? `\n\n${extra}` : ''}${warn}`;
+}
+
+function stageText(user, p) {
+  const st = stageOf(p);
+  const head = `${stageDots(STAGE_NO[st])}\n<b>Этап ${STAGE_NO[st]} из 4 · ${STAGE_NAME[st]}</b>\n\n`;
+  if (st === 'talk') {
+    return head + `Пришлите сюда то, что должно звучать в ролике:
+🎤 <b>видео, где вы говорите</b> в камеру — можно несколько файлов и дублей, лучший выберу сам;
+🎙 <b>голосовое сообщение</b> — зажмите микрофон внизу чата и наговорите текст (или пришлите аудиофайл). Под него я подберу картинку.
+
+Можно и видео, и голосовое вместе. Речи в ролике не будет — сразу жмите «Дальше».`;
+  }
+  if (st === 'broll') {
+    return head + `Пришлите видео, которые пойдут картинкой: продукт, процесс, место, детали, люди. Звук и речь в них я не слушаю.
+💡 Видео, снятые в 60 кадров/с, смогу плавно замедлить.
+
+Сейчас только принимаю файлы — разберу их, когда нажмёте «Дальше». Перебивок нет — тоже жмите «Дальше».`;
+  }
+  if (st === 'brief') {
+    const had = p.brief.length ? `\n\nУже записано:\n${p.brief.map((t) => `• ${esc(t)}`).join('\n')}` : '';
+    return head + `Напишите коротко, каким должен быть ролик, например:
+• «ролик на 30 секунд, начни с цены»
+• «динамично, в конце — призыв написать в директ»
+Можно несколькими сообщениями.
+
+Или нажмите «🎨 На выбор ИИ» — смонтирую по вашему паспорту стиля${creativeOn(user) ? ' и сам усилю ролик ради удержания' : ''}.${had}`;
+  }
+  return readyText(user, p);
+}
+
+function readyText(user, p) {
+  const cnt = (r) => p.sources.filter((s) => roleOf(s) === r).length;
+  const src = [cnt('talk') ? `🎤 с речью: ${cnt('talk')}` : '', cnt('voice') ? `🎙 озвучка: ${cnt('voice')}` : '', cnt('broll') ? `🎞 перебивки: ${cnt('broll')}` : ''].filter(Boolean).join(' · ');
+  const wishes = p.brief.length ? p.brief.map((t) => `• ${esc(t)}`).join('\n') : `🎨 на выбор ИИ — по вашему паспорту стиля${creativeOn(user) ? ' и с усилением ради удержания' : ''}`;
+  const est = estimateCost(user);
+  const wait = p.sources.some((s) => needsAnalysis(user, s) && !s.aiError) ? '\n⏳ Ещё разбираю исходники — можно нажать «Смонтировать» сейчас: начну, как только закончу.' : '';
+  return `${stageDots(4)}
+<b>Этап 4 из 4 · Монтаж</b>
+
+<b>Исходники:</b> ${src || 'нет'}
+<b>Пожелания:</b>
+${wishes}
+
+💰 <b>Прогноз расхода на ИИ:</b> ≈${fmtUsd(est.low)}–${fmtUsd(est.high)}. ${esc(est.note)}${wait}
+
+Нажмите «▶️ Смонтировать». Готовый ролик придёт сюда, правки пишите обычным сообщением — у каждой правки будет своя цена.`;
+}
+
+/** Начать новый ролик: вводная про 4 этапа + первый этап */
+async function startWizard(user, chatId, extra = '') {
+  const p = user.project || newProject(user);
+  p.stage = 'talk';
+  await saveUser(user);
+  await send(chatId, introText(user, p, extra));
+  await send(chatId, stageText(user, p), { reply_markup: stageKb(p) });
+}
+
+/** Сменить этап. Уходя с этапа перебивок — запускаем их разбор в фоне. */
 async function setStage(user, chatId, stage) {
   const p = user.project || newProject(user);
+  if (stage === 'ready' && !p.sources.length && !(pending.get(user.id) || 0)) {
+    p.stage = 'talk';
+    await saveUser(user);
+    return send(chatId, '⚠️ Для монтажа нужен хотя бы один файл. Начнём с этапа 1.\n\n' + stageText(user, p), { reply_markup: stageKb(p) });
+  }
   p.stage = stage;
   p.summarySig = '';
   await saveUser(user);
-  await send(chatId, stage === 'broll' ? '🎞 Теперь присылайте перебивки: продукт, процесс, место. Речь в них разбирать не буду.' : '🎤 Теперь присылайте видео, где вы говорите, или озвучку.', { reply_markup: kb([[stageBtn(p)]]) });
+  if (STAGE_NO[stage] > 2) await kickDeferred(user, chatId);
+  await send(chatId, stageText(user, p), { reply_markup: stageKb(p) });
+}
+
+/** Перебивки этапа 2 принимаются без ИИ; разбираем их одним заходом, когда этап закончен */
+const kicked = new Set();
+async function kickDeferred(user, chatId) {
+  const p = user.project;
+  if (!p) return;
+  const key = (s) => `${user.id}:${p.id}:${s.n}`;
+  const todo = p.sources.filter((s) => roleOf(s) === 'broll' && needsAnalysis(user, s) && !kicked.has(key(s)));
+  if (!todo.length) return;
+  todo.forEach((s) => kicked.add(key(s)));
+  const st = await progress(user, chatId, `🎞 Разбираю перебивки: ${todo.length}…`);
+  background(user, chatId, async () => {
+    let fail = 0;
+    await Promise.all(
+      todo.map((s) =>
+        analyzePatiently(user, s, (t) => st.set(t))
+          .catch((e) => {
+            s.aiError = e.message;
+            fail++;
+          })
+          .finally(() => kicked.delete(key(s)))
+      )
+    );
+    await saveUser(user);
+    await st.done(fail ? `⚠️ Перебивки: разобрано ${todo.length - fail} из ${todo.length}. Остальные попробую ещё раз при монтаже.` : `✅ Перебивки разобраны: ${todo.length}. ${todo.map((s) => sourceLine(s).replace(/^✅ /, '')).join('; ')}`);
+  });
 }
 
 /** Переназначить роль уже принятого видео: перебивка ↔ речь */
@@ -1484,7 +1601,7 @@ async function afterSources(user, chatId) {
   const what = [cnt('talk') ? `с речью: ${cnt('talk')}` : '', cnt('broll') ? `перебивки: ${cnt('broll')}` : '', cnt('voice') ? `озвучка: ${cnt('voice')}` : ''].filter(Boolean).join(', ');
   await send(
     chatId,
-    `Исходников: <b>${p.sources.length}</b> (${what}).\n${stageLine(p)}\nМожно прислать ещё или написать пожелание к ролику, например «ролик на 30 секунд, начни с цены».`,
+    `Исходников: <b>${p.sources.length}</b> (${what}).\n${stageLine(p)}\n${{ talk: 'Можно прислать ещё видео с речью или голосовое. Всё — жмите «Дальше».', broll: 'Можно прислать ещё перебивки. Всё — жмите «Дальше».', brief: 'Напишите пожелания или жмите кнопку ниже.', ready: 'Файл добавлен. Можно монтировать.' }[stageOf(p)]}`,
     { reply_markup: montageKb(p) }
   );
 }
@@ -2264,23 +2381,15 @@ const HELLO = `Привет! Я Магическая кастрюля — мон
 2. Я разберу их и покажу «паспорт стиля» — как я понял вашу манеру.
 3. Подтвердите паспорт или поправьте его сообщением: «субтитры у меня всегда жёлтые».
 
-<b>Монтаж</b> (/edit)
-1. Пришлите исходники одного ролика: видео, где вы говорите, отдельные перебивки, озвучку голосовым или аудиофайлом.
-2. Если нужно — напишите пожелание: «ролик на 30 секунд, начни с цены».
-3. Нажмите «🎬 Смонтировать». Готовый ролик придёт сюда, правки — сообщением.
+<b>Монтаж</b> (/edit или /new) — 4 этапа, на каждом подскажу, что делать:
+1. Речь: видео, где вы говорите, и/или голосовое с закадровым текстом.
+2. Перебивки: видео для картинки — продукт, процесс, место.
+3. Пожелания к ролику — или «на выбор ИИ».
+4. Монтаж: покажу цену, смонтирую, правки — сообщением.
 
 Команды: /status — что загружено, /style — паспорт, /new — новый ролик, /reset — удалить всё.`;
 
-const EDIT_HELLO = `🎬 <b>Режим монтажа.</b> Исходники принимаю в два этапа:
 
-<b>1. Речь.</b> Видео, где вы говорите (можно несколько файлов и дублей), и/или озвучка голосовым или аудиофайлом. Речь здесь я разбираю.
-<b>2. Перебивки.</b> Нажмите «🎞 Дальше — перебивки» (или /broll) и присылайте продукт, процесс, место. Речь в них не разбираю — это экономит время и деньги.
-
-Можно и так: только озвучка + перебивки (видеоряд подберу под каждую фразу), только видео с речью, или речь в кадре + отдельная озвучка вместе.
-
-Пожелания к ролику пишите текстом. Потом нажмите «🎬 Смонтировать».
-Переназначить файл: /broll 3 или /talk 3. Новый ролик — /new. Учёба — /learn.
-По умолчанию ИИ не только копирует ваш стиль, но и усиливает ролик ради удержания (крючок, динамика, без воды). Отключить — /creative.`;
 
 const HOW_TO_SAVE = `По ссылке забрать ролик не получится: Instagram не отдаёт видео с музыкой из своей библиотеки.
 
@@ -2408,9 +2517,12 @@ async function onMessage(msg) {
   if (/^\/edit\b/.test(text)) {
     if (!user.passport) return void (await send(chatId, 'Сначала научите меня своему стилю: пришлите 5–15 готовых роликов и соберите паспорт.'));
     user.mode = 'edit';
+    const fresh = !user.project || (!user.project.sources.length && !user.project.brief.length && !user.project.result);
     if (!user.project) newProject(user);
     await saveUser(user);
-    return void (await send(chatId, EDIT_HELLO + (user.passport.confirmed ? '' : '\n\n⚠️ Паспорт стиля ещё не подтверждён — монтирую по текущей версии.')));
+    if (fresh) return void (await startWizard(user, chatId));
+    if (user.project.result) return void (await send(chatId, `🎬 <b>Ролик №${user.project.id}</b> готов. Правки пишите сообщением, новый ролик — /new.`));
+    return void (await send(chatId, `🎬 <b>Продолжаем ролик №${user.project.id}.</b>\n\n` + stageText(user, user.project), { reply_markup: stageKb(user.project) }));
   }
   if (/^\/learn\b/.test(text)) {
     user.mode = 'learn';
@@ -2423,7 +2535,7 @@ async function onMessage(msg) {
     user.mode = 'edit';
     await resetProject(user);
     await saveUser(user);
-    return void (await send(chatId, `🆕 Ролик №${user.project.id}. Присылайте исходники.`));
+    return void (await startWizard(user, chatId));
   }
   if (/^\/(style|passport)\b/.test(text)) {
     if (user.passport) {
@@ -2490,14 +2602,16 @@ async function onMessage(msg) {
     if (!user.project) newProject(user);
     const p = user.project;
     if (p.result) return void enqueue(user, chatId, () => makeMontage(user, chatId, text));
-    if (!p.sources.length && !pending.get(user.id)) {
-      p.brief.push(text);
-      await saveUser(user);
-      return void (await send(chatId, 'Записал пожелание. Теперь пришлите исходники ролика: видео, перебивки или озвучку.'));
-    }
     p.brief.push(text);
     await saveUser(user);
-    return void (await send(chatId, `Учту при монтаже: «${esc(text)}».`, { reply_markup: montageKb(p) }));
+    const st = stageOf(p);
+    const tail = {
+      talk: `Учту на этапе монтажа. А сейчас — ${stageLine(p).replace(/^\S+ Сейчас: /, '')}: пришлите видео с речью или голосовое, либо жмите «Дальше».`,
+      broll: `Учту на этапе монтажа. А сейчас — ${stageLine(p).replace(/^\S+ Сейчас: /, '')}: пришлите перебивки или жмите «Дальше».`,
+      brief: 'Ещё пожелание — пишите следующим сообщением. Всё — жмите «Дальше: монтаж».',
+      ready: 'Учту при монтаже.',
+    }[st];
+    return void (await send(chatId, `✍️ Записал пожелание: «${esc(text)}».\n${tail}`, { reply_markup: stageKb(p) }));
   }
 
   if (text) {
@@ -2520,7 +2634,7 @@ const busy = (user) => isBusy(user);
 async function onSourceMedia(user, chatId, m) {
   if (!user.project) newProject(user);
   const p = user.project;
-  if (!m.role) m.role = m.kind === 'audio' ? 'voice' : p.stage === 'broll' ? 'broll' : 'talk';
+  if (!m.role) m.role = m.kind === 'audio' ? 'voice' : stageOf(p) === 'talk' ? 'talk' : 'broll';
   // К готовому ролику прислали ещё файлы — спрашиваем, к какому ролику они
   if (p.result && !p.open) {
     user.hold = user.hold || [];
@@ -2580,29 +2694,18 @@ async function onCallback(q) {
       if (!user.project) newProject(user);
       await saveUser(user);
       await send(chatId, `✅ Паспорт стиля (версия ${user.passport.version}) сохранён.\n\nУточнить его можно в любой момент: /style → «Поправить», или пришлите ещё примеров в режиме учёбы (/learn).`);
-      await send(chatId, EDIT_HELLO);
+      await startWizard(user, chatId);
       break;
     case 'fix':
       await done();
       user.awaitFix = true;
       await send(chatId, 'Напишите одним сообщением, что не так в паспорте. Например:\n• «субтитры у меня всегда жёлтые, внизу»\n• «музыку я ставлю тише»\n• «в начале всегда крупный план продукта»');
       break;
-    case 'm_go': {
-      await dropButtons();
-      const p = user.project;
-      if (!p || (!p.sources.length && !busy(user))) {
-        await done();
-        await send(chatId, 'Сначала пришлите исходники ролика.');
-        break;
-      }
-      // сначала прогноз расхода, запуск — по кнопке
-      const est = estimateCost(user);
+    case 'm_go':
       await done();
-      await send(chatId, `💰 <b>Прогноз расхода на ИИ:</b> ≈${fmtUsd(est.low)}–${fmtUsd(est.high)}\n${esc(est.note)}\nЗапускаем монтаж?`, {
-        reply_markup: kb([[['▶️ Запустить', 'm_run'], ['✖️ Отмена', 'm_cancel']]]),
-      });
+      await dropButtons();
+      await setStage(user, chatId, 'ready');
       break;
-    }
     case 'm_run': {
       await dropButtons();
       const p = user.project;
@@ -2619,11 +2722,18 @@ async function onCallback(q) {
       await dropButtons();
       await done('Отменено');
       break;
-    case 'st_broll':
     case 'st_talk':
+    case 'st_broll':
+    case 'st_brief':
+    case 'st_ready':
       await done();
       await dropButtons();
-      await setStage(user, chatId, q.data === 'st_broll' ? 'broll' : 'talk');
+      if (user.project && user.project.result && !user.project.open) {
+        await send(chatId, 'Этот ролик уже смонтирован: правки пишите сообщением. Новый ролик — /new.');
+        break;
+      }
+      user.mode = 'edit';
+      await setStage(user, chatId, q.data.slice(3));
       break;
     case 'm_clear':
     case 'm_new':
@@ -2636,7 +2746,7 @@ async function onCallback(q) {
         await resetProject(user);
         user.mode = 'edit';
         await saveUser(user);
-        await send(chatId, q.data === 'm_clear' ? 'Исходники удалены. Присылайте новые.' : `🆕 Ролик №${user.project.id}. ${held.length ? 'Беру присланные файлы.' : 'Присылайте исходники.'}`);
+        await startWizard(user, chatId, q.data === 'm_clear' ? '🗑 Прежние исходники удалены.' : held.length ? '📥 Беру присланные файлы — они идут на этап 1.' : '');
         for (const m of held) await onSourceMedia(user, chatId, m);
       }
       break;
@@ -2755,7 +2865,7 @@ async function recover() {
     user.live = [];
     const inbox = user.inbox || [];
     const p = user.project;
-    const unfinished = p ? p.sources.filter((s) => needsAnalysis(user, s)) : [];
+    const unfinished = p ? p.sources.filter((s) => needsAnalysis(user, s) && !(roleOf(s) === 'broll' && stageOf(p) === 'broll')) : [];
     await saveUser(user);
     if (!inbox.length && !unfinished.length && !wasMontage) continue;
     const parts = ['♻️ Бот перезапускался.'];
