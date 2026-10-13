@@ -1,9 +1,15 @@
-# Монтажёр: бот + свой сервер Telegram Bot API (для файлов больше 20 МБ) + ffmpeg
+# Магическая кастрюля: бот + свой сервер Telegram Bot API (для файлов больше 20 МБ) + ffmpeg + шрифты для субтитров
 # На Railway укажите переменную RAILWAY_DOCKERFILE_PATH=Magic pan-Dockerfile
 FROM aiogram/telegram-bot-api:latest
 
 USER root
-RUN apk add --no-cache nodejs ffmpeg && node -v && ffmpeg -version | head -n 1
+RUN apk add --no-cache nodejs ffmpeg fontconfig ttf-dejavu \
+ && (apk add --no-cache font-montserrat || true) \
+ && mkdir -p /app/fonts \
+ && (wget -q -O /app/fonts/Montserrat-ExtraBold.ttf https://github.com/JulietaUla/Montserrat/raw/master/fonts/ttf/Montserrat-ExtraBold.ttf || rm -f /app/fonts/Montserrat-ExtraBold.ttf; true) \
+ && fc-cache -f >/dev/null 2>&1; \
+ node -v && ffmpeg -version | head -n 1 \
+ && (ffmpeg -hide_banner -filters 2>/dev/null | grep -q " ass " && echo "субтитры: ok" || echo "ВНИМАНИЕ: в ffmpeg нет фильтра ass — ролики будут без субтитров")
 
 WORKDIR /app
 COPY ["Magic pan-server.js", "./"]
