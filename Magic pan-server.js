@@ -31,6 +31,9 @@ const CFG = {
   tokPerSec: Number(process.env.TOK_PER_SEC || 70),
   keepProjects: Number(process.env.KEEP_PROJECTS || 5), // сколько прошлых роликов с исходниками хранить для /history
   tz: process.env.TZ_NAME || 'Europe/Kyiv',
+  libraryMaxMb: Number(process.env.LIBRARY_MAX_MB || 2500), // медиатека: сверх этого удаляются самые старые файлы
+  libShotsMax: Number(process.env.LIBRARY_SHOTS || 150), // сколько планов из медиатеки показывать ИИ за раз
+  cutCover: Number(process.env.CUT_COVER || 1), // секунд перебивки до и после склейки в речи
   // Свой сервер Bot API (нужен для файлов больше 20 МБ)
   botApiUrl: (process.env.BOT_API_URL || '').replace(/\/+$/, ''),
   botApiBin: process.env.BOT_API_BIN || '/usr/local/bin/telegram-bot-api',
@@ -186,7 +189,10 @@ async function getUser(id, name) {
   }
   return users.get(id);
 }
-const saveUser = (u) => writeJson(path.join(userDir(u.id), 'state.json'), u);
+const saveUser = (u) => {
+  syncLibrary(u);
+  return writeJson(path.join(userDir(u.id), 'state.json'), u);
+};
 
 // ───────────────────────────── Telegram ─────────────────────────────
 
@@ -868,7 +874,7 @@ function pickVideo(msg) {
   const fromDoc = msg.document && (/^video\//.test(msg.document.mime_type || '') || /\.(mp4|mov|m4v|webm|mkv|avi)$/i.test(msg.document.file_name || ''));
   const v = msg.video || (fromDoc ? msg.document : null) || msg.video_note || null;
   if (!v) return null;
-  return { fileId: v.file_id, size: v.file_size || 0, name: v.file_name || '' };
+  return { fileId: v.file_id, uid: v.file_unique_id || '', size: v.file_size || 0, name: v.file_name || '' };
 }
 
 async function fetchTelegramFile(fileId, dest) {
@@ -1027,10 +1033,59 @@ function fmtDur(sec) {
 }
 
 const projDir = (user, p = user.project) => path.join(userDir(user.id), (p && p.dir) || 'project');
+const libDir = (user) => path.join(userDir(user.id), 'library');
+/** Путь к файлу исходника: новые лежат в медиатеке, старые — в папке ролика */
+const srcPath = (user, src, which = 'file') => (src.lib ? path.join(libDir(user), src[which]) : path.join(projDir(user), src[which]));
+
+/** Медиатека: каждый присланный исходник с разбором ИИ остаётся в профиле для следующих роликов */
+const LIB_FIELDS = ['uid', 'kind', 'role', 'file', 'wav', 'duration', 'width', 'height', 'fps', 'orientation', 'hasAudio', 'silences', 'speechShare', 'ai', 'aiError'];
+function syncLibrary(user) {
+  if (!user.library || !user.project) return;
+  const byLid = new Map(user.library.map((x) => [x.lid, x]));
+  for (const s of user.project.sources) {
+    if (s.fromLibrary) continue; // взятое из медиатеки не перезаписывает её разбор (роль в этом ролике может быть другой)
+    const e = s.lid && byLid.get(s.lid);
+    if (e) for (const k of LIB_FIELDS) e[k] = s[k];
+  }
+}
+
+async function addToLibrary(user, src, p) {
+  user.library = user.library || [];
+  let bytes = 0;
+  for (const w of ['file', 'wav']) if (src[w]) bytes += await fsp.stat(srcPath(user, src, w)).then((x) => x.size).catch(() => 0);
+  const e = { lid: src.lid, project: p.id, addedAt: new Date().toISOString(), bytes };
+  for (const k of LIB_FIELDS) e[k] = src[k];
+  user.library.push(e);
+  // место на диске: сверх лимита удаляем самые старые файлы, которых нет в текущем ролике
+  const inUse = new Set(p.sources.map((x) => x.lid));
+  let total = user.library.reduce((a, x) => a + (x.bytes || 0), 0);
+  const removed = [];
+  for (const x of [...user.library]) {
+    if (total <= CFG.libraryMaxMb * 1e6) break;
+    if (inUse.has(x.lid)) continue;
+    await removeFromLibrary(user, x);
+    total -= x.bytes || 0;
+    removed.push(x.lid);
+  }
+  return removed;
+}
+
+async function removeFromLibrary(user, e) {
+  user.library = (user.library || []).filter((x) => x.lid !== e.lid);
+  for (const w of ['file', 'wav']) if (e[w]) await fsp.unlink(path.join(libDir(user), e[w])).catch(() => {});
+}
+
+/** О чём видео из медиатеки — для ИИ и для списка */
+function libSummary(e) {
+  const ai = e.ai || {};
+  const said = (ai.phrases || []).map((x) => x.text).join(' ').trim();
+  const seen = (ai.shots || []).filter((x) => x.kind !== 'junk').map((x) => x.what).filter(Boolean);
+  return said ? `говорится: «${said.slice(0, 140)}${said.length > 140 ? '…' : ''}»` : seen.length ? `в кадре: ${seen.slice(0, 3).join('; ')}` : '';
+}
 
 function newProject(user) {
   user.projSeq = (user.projSeq || 0) + 1;
-  user.project = { id: user.projSeq, dir: `projects/${user.projSeq}`, seq: 0, stage: 'talk', sources: [], brief: [], fixes: [], plan: null, version: 0, result: null, history: [], final: null, open: false, createdAt: new Date().toISOString() };
+  user.project = { id: user.projSeq, dir: `projects/${user.projSeq}`, useLibrary: !!user.useLibraryDefault, seq: 0, stage: 'talk', sources: [], brief: [], fixes: [], plan: null, version: 0, result: null, history: [], final: null, open: false, createdAt: new Date().toISOString() };
   return user.project;
 }
 
@@ -1081,7 +1136,7 @@ function pickMedia(msg) {
   if (!a) return null;
   const byMime = { 'audio/mpeg': '.mp3', 'audio/mp3': '.mp3', 'audio/mp4': '.m4a', 'audio/x-m4a': '.m4a', 'audio/ogg': '.ogg', 'audio/wav': '.wav', 'audio/x-wav': '.wav', 'audio/flac': '.flac', 'audio/aac': '.aac' };
   const name = a.file_name || `audio${byMime[a.mime_type] || '.ogg'}`;
-  return { fileId: a.file_id, size: a.file_size || 0, name, kind: 'audio' };
+  return { fileId: a.file_id, uid: a.file_unique_id || '', size: a.file_size || 0, name, kind: 'audio' };
 }
 
 async function probeAudio(file) {
@@ -1249,7 +1304,7 @@ async function analyzeSource(user, src, opts = {}) {
     return;
   }
   await aiSlot(async () => {
-    const up = await geminiUpload(path.join(dir, src.wav));
+    const up = await geminiUpload(srcPath(user, src, 'wav'));
     try {
       const j = await geminiJson(user, [{ file_data: { mime_type: up.mime, file_uri: up.uri } }, { text: promptTranscribe(src) }], { long: true, fast: true, onWait: opts.onWait });
       src.ai.language = txt(j.language) || '';
@@ -1261,7 +1316,7 @@ async function analyzeSource(user, src, opts = {}) {
 }
 
 async function shotsSingle(user, src, opts = {}) {
-  const up = await geminiUpload(path.join(projDir(user), src.file), 15 * 60 * 1000);
+  const up = await geminiUpload(srcPath(user, src), 15 * 60 * 1000);
   try {
     return await geminiJson(user, [{ file_data: { mime_type: up.mime, file_uri: up.uri } }, { text: promptShots(src) }], { long: true, lowRes: true, fast: true, onWait: opts.onWait });
   } finally {
@@ -1321,7 +1376,7 @@ async function runShotBatch(user, items) {
   const ups = [];
   try {
     await aiSlot(async () => {
-      for (const it of items) ups.push(await geminiUpload(path.join(projDir(user), it.src.file), 15 * 60 * 1000));
+      for (const it of items) ups.push(await geminiUpload(srcPath(user, it.src), 15 * 60 * 1000));
       const parts = [];
       items.forEach((it, i) => {
         parts.push({ text: `Файл ${i + 1} (длительность ${it.src.duration.toFixed(1)} с, кадр ${it.src.width}×${it.src.height}):` });
@@ -1369,7 +1424,7 @@ function sourceLine(src) {
     const b = ai.shots.filter((s) => s.kind === 'broll' && s.quality !== 'bad').length;
     parts.push(`${ai.shots.length} ${plural(ai.shots.length, 'план', 'плана', 'планов')}${b ? `, для перебивок: ${b}` : ''}`);
   }
-  if (role === 'broll' && !ai.shots && !src.aiError) parts.push('принят, разберу после этапа 2');
+  if (role === 'broll' && !ai.shots && !src.aiError) parts.push('принят, разберу после «Дальше»');
   return `${src.aiError ? '⚠️' : ai.shots || ai.phrases ? '✅' : '📥'} ${parts.join(' · ')}`;
 }
 
@@ -1378,10 +1433,37 @@ async function processSource(user, chatId, m) {
   const n = ++p.seq;
   const st = await progress(user, chatId, `⏳ Исходник ${n}: получаю файл…`);
   const say = (t) => st.set(t);
-  const dir = projDir(user);
+  const dir = libDir(user);
   await fsp.mkdir(dir, { recursive: true });
+  await fsp.mkdir(projDir(user), { recursive: true });
+  // Тот же файл уже есть в медиатеке (Telegram даёт ему тот же file_unique_id) — берём готовый разбор, без ИИ
+  const known = m.uid && (user.library || []).find((e) => e.uid === m.uid && fs.existsSync(path.join(libDir(user), e.file)));
+  if (known) {
+    const role = m.kind === 'audio' ? 'voice' : m.role === 'broll' ? 'broll' : 'talk';
+    const src = { n, lid: known.lid, lib: true, fromLibrary: true };
+    for (const k of LIB_FIELDS) src[k] = known[k] && typeof known[k] === 'object' ? JSON.parse(JSON.stringify(known[k])) : known[k];
+    if (src.role !== role) {
+      src.role = role;
+      if (src.ai && role === 'broll') src.ai.phrases = [];
+      if (src.ai && role === 'talk' && src.ai.language === 'none') delete src.ai.phrases;
+    }
+    delete src.aiError;
+    p.sources.push(src);
+    if (m.replaceN) {
+      p.sources = p.sources.filter((x) => x.n !== m.replaceN);
+      src.replaced = m.replaceN;
+    }
+    dropInbox(user, m);
+    await saveUser(user);
+    if (!needsAnalysis(user, src) || (role === 'broll' && isUpload(stageOf(p)))) {
+      return void (await st.done(`${sourceLine(src)} — 📚 уже был в медиатеке, разбор готов${src.replaced ? ` · 🔁 вместо исходника ${src.replaced}` : ''}`));
+    }
+    await st.done(`${sourceLine(src)} — 📚 из медиатеки`);
+    return void background(user, chatId, () => analyzePatiently(user, src, async () => {}).catch((e) => (src.aiError = e.message))).then(() => setTimeout(() => afterSources(user, chatId).catch(() => {}), 50));
+  }
+  const lid = (user.libSeq = (user.libSeq || 0) + 1);
   const ext = (path.extname(m.name) || (m.kind === 'audio' ? '.ogg' : '.mp4')).toLowerCase().replace(/[^.a-z0-9]/g, '') || '.mp4';
-  let file = path.join(dir, `src-${n}${ext}`);
+  let file = path.join(dir, `lib-${lid}${ext}`);
   try {
     if (m.size && (await freeMb(dir)) < (m.size / 1e6) * 1.5 + 300) {
       throw new Error('на диске сервера мало места. Начните новый ролик (/new) или удалите лишние примеры (/learn → /del)');
@@ -1397,34 +1479,35 @@ async function processSource(user, chatId, m) {
     if (meta.duration > CFG.maxSourceSec) throw new Error(`файл длится ${fmtDur(meta.duration)}, можно до ${fmtDur(CFG.maxSourceSec)}`);
     const total = p.sources.reduce((s, x) => s + x.duration, 0) + meta.duration;
     if (total > CFG.maxProjectSec) throw new Error(`все исходники вместе длиннее ${Math.round(CFG.maxProjectSec / 60)} мин`);
-    const src = { n, kind: m.kind, role: m.kind === 'audio' ? 'voice' : m.role === 'broll' ? 'broll' : 'talk', file: path.basename(file), duration: meta.duration, width: meta.width || 0, height: meta.height || 0, fps: meta.fps || 0, orientation: meta.orientation || '', hasAudio: !!meta.hasAudio, silences: [], speechShare: 0, ai: null };
+    const src = { n, lid, lib: true, uid: m.uid || '', kind: m.kind, role: m.kind === 'audio' ? 'voice' : m.role === 'broll' ? 'broll' : 'talk', file: path.basename(file), duration: meta.duration, width: meta.width || 0, height: meta.height || 0, fps: meta.fps || 0, orientation: meta.orientation || '', hasAudio: !!meta.hasAudio, silences: [], speechShare: 0, ai: null };
     if (src.hasAudio) {
       await say(`⏳ Исходник ${n}: слушаю звук…`);
-      src.wav = `src-${n}.wav`;
-      const wr = await run(CFG.ffmpeg, ['-hide_banner', '-y', '-i', file, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', path.join(dir, src.wav)]);
+      src.wav = `lib-${lid}.wav`;
+      const wr = await run(CFG.ffmpeg, ['-hide_banner', '-y', '-i', file, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', srcPath(user, src, 'wav')]);
       if (wr.code !== 0) {
         src.hasAudio = false;
         delete src.wav;
       } else {
-        Object.assign(src, await silenceMap(path.join(dir, src.wav), src.duration));
+        Object.assign(src, await silenceMap(srcPath(user, src, 'wav'), src.duration));
       }
     }
     if (src.kind === 'audio' && !src.hasAudio) throw new Error('не удалось прочитать звук');
     if (user.project !== p) throw new Error('пока файл загружался, вы начали новый ролик');
     p.sources.push(src);
     if (m.replaceN) {
-      // замена: старый исходник убираем (готовые варианты в истории остаются)
+      // замена: старый исходник убираем из ролика (в медиатеке и в истории он остаётся)
       const old = p.sources.find((x) => x.n === m.replaceN);
       if (old) {
         p.sources = p.sources.filter((x) => x !== old);
-        for (const f of [old.file, old.wav]) if (f) await fsp.unlink(path.join(dir, f)).catch(() => {});
+        if (!old.lib) for (const f of [old.file, old.wav]) if (f) await fsp.unlink(path.join(projDir(user), f)).catch(() => {});
       }
       src.replaced = m.replaceN;
     }
+    await addToLibrary(user, src, p);
     dropInbox(user, m);
     await saveUser(user);
-    // Перебивки этапа 2 пока только принимаем: ИИ разберёт их, когда этап закончится
-    if (src.role === 'broll' && stageOf(p) === 'broll') return void (await st.done(sourceLine(src)));
+    // Перебивки пока только принимаем: ИИ разберёт их, когда этап «Материалы» закончится
+    if (src.role === 'broll' && isUpload(stageOf(p))) return void (await st.done(sourceLine(src)));
     // Разбор ИИ идёт параллельно: очередь сразу берёт следующий файл
     await say(`⏳ Исходник ${n}: жду очереди к ИИ…`);
     background(user, chatId, () =>
@@ -1462,19 +1545,40 @@ async function aiSlot(fn) {
   }
 }
 
-// ── Мастер нового ролика: 4 этапа ──
-const STAGE_NO = { talk: 1, broll: 2, brief: 3, ready: 4 };
-const STAGE_NAME = { talk: 'Речь', broll: 'Перебивки', brief: 'Пожелания', ready: 'Монтаж' };
+// ── Мастер нового ролика: 3 этапа. На первом пользователь сам выбирает, что загружает ──
+// talk / broll / voice — режимы загрузки внутри этапа «Материалы»
+const UPLOAD = new Set(['talk', 'broll', 'voice']);
+const STAGE_NO = { talk: 1, broll: 1, voice: 1, brief: 2, ready: 3 };
+const STAGE_NAME = { talk: 'Материалы', broll: 'Материалы', voice: 'Материалы', brief: 'Пожелания', ready: 'Монтаж' };
+const UP_NAME = { talk: '🎤 видео с речью', broll: '🎞 перебивки', voice: '🎙 голос' };
 const stageOf = (p) => (p && STAGE_NO[p.stage] ? p.stage : 'talk');
-const stageDots = (n) => [1, 2, 3, 4].map((i) => (i < n ? '✅' : i === n ? '🔵' : '⚪')).join('');
-const stageLine = (p) => `${stageDots(STAGE_NO[stageOf(p)])} Сейчас: <b>этап ${STAGE_NO[stageOf(p)]} из 4 · ${STAGE_NAME[stageOf(p)]}</b>`;
-
-function stageKb(p) {
+const isUpload = (st) => UPLOAD.has(st);
+const stageDots = (n) => [1, 2, 3].map((i) => (i < n ? '✅' : i === n ? '🔵' : '⚪')).join('');
+const stageLine = (p) => {
   const st = stageOf(p);
-  if (st === 'talk') return kb([[['➡️ Дальше: перебивки', 'st_broll']]]);
-  if (st === 'broll') return kb([[['➡️ Дальше: пожелания', 'st_brief']], [['⬅️ Назад: речь', 'st_talk']]]);
-  if (st === 'brief') return kb([[p.brief.length ? ['➡️ Дальше: монтаж', 'st_ready'] : ['🎨 На выбор ИИ', 'st_ready']], [['⬅️ Назад: перебивки', 'st_broll']]]);
-  return kb([[['▶️ Смонтировать', 'm_run']], [['✍️ Пожелания', 'st_brief'], ['➕ Ещё файлы', 'st_talk']], [['🗑 Начать заново', 'm_clear']]]);
+  return `${stageDots(STAGE_NO[st])} Сейчас: <b>этап ${STAGE_NO[st]} из 3 · ${STAGE_NAME[st]}</b>${isUpload(st) ? ` — загружаем ${UP_NAME[st]}` : ''}`;
+};
+
+/** Сколько видео медиатеки (кроме исходников этого ролика) годятся для перебивок */
+function libraryCount(user) {
+  if (!user || !user.project) return 0;
+  const inProj = new Set(user.project.sources.map((s) => s.lid).filter(Boolean));
+  return (user.library || []).filter((e) => !inProj.has(e.lid) && e.kind === 'video' && e.ai && Array.isArray(e.ai.shots) && e.ai.shots.some((x) => x.kind === 'broll')).length;
+}
+
+/** Кнопки выбора, что загружаем; текущий режим отмечен галочкой */
+function uploadRows(p) {
+  const st = stageOf(p);
+  const b = (mode, label) => [`${st === mode ? '✅ ' : ''}${label}`, `up:${mode}`];
+  return [[b('broll', '🎞 Перебивки'), b('talk', '🎤 Видео с речью')], [b('voice', '🎙 Голос (озвучка)')]];
+}
+
+function stageKb(p, user) {
+  const st = stageOf(p);
+  if (isUpload(st)) return kb([...uploadRows(p), [['➡️ Дальше: пожелания', 'st_brief']]]);
+  if (st === 'brief') return kb([[p.brief.length ? ['➡️ Дальше: монтаж', 'st_ready'] : ['🎨 На выбор ИИ', 'st_ready']], [['⬅️ Назад: материалы', 'st_up']]]);
+  const libBtn = libraryCount(user) ? [[[p.useLibrary ? '📚 Медиатека: ВКЛ — выключить' : '📚 Медиатека: выкл — включить', 'lib_t']]] : [];
+  return kb([[['▶️ Смонтировать', 'm_run']], ...libBtn, [['✍️ Пожелания', 'st_brief'], ['➕ Ещё файлы', 'st_up']], [['🗑 Начать заново', 'm_clear']]]);
 }
 const montageKb = stageKb;
 
@@ -1482,35 +1586,42 @@ function introText(user, p, extra = '') {
   const warn = user.passport && !user.passport.confirmed ? '\n\n⚠️ Паспорт стиля ещё не подтверждён — монтирую по текущей версии.' : '';
   return `🎬 <b>Режим монтажа · Ролик №${p.id}</b>
 
-Соберём ролик за 4 этапа. На каждом я скажу, что прислать, и дам кнопку «Дальше»:
+Соберём ролик за 3 этапа:
 
-1️⃣ <b>Речь</b> — видео, где вы говорите в камеру, и/или голосовое сообщение с закадровым текстом
-2️⃣ <b>Перебивки</b> — видео для картинки: продукт, процесс, место. Речь в них не слушаю
-3️⃣ <b>Пожелания</b> — коротко, каким должен быть ролик, или «на выбор ИИ»
-4️⃣ <b>Монтаж и правки</b> — покажу цену, смонтирую, правки пишете текстом
+1️⃣ <b>Материалы.</b> Кнопкой выбираете, что загружаете, и присылаете файлы. Переключаться можно в любом порядке — например, сначала перебивки, потом голос поверх:
+   🎞 <b>перебивки</b> — видео для картинки, речь в них не слушаю;
+   🎤 <b>видео с речью</b> — где вы говорите в камеру;
+   🎙 <b>голос</b> — голосовое или аудиофайл, под него подберу картинку.
+2️⃣ <b>Пожелания</b> — коротко, каким должен быть ролик, или «на выбор ИИ».
+3️⃣ <b>Монтаж и правки</b> — покажу цену, смонтирую, правки пишете текстом.${extra ? `\n\n${extra}` : ''}${warn}`;
+}
 
-Этапы можно пропускать: например, только голосовое + перебивки или только видео с речью.${extra ? `\n\n${extra}` : ''}${warn}`;
+/** Что уже загружено — одной строкой */
+function loadedLine(p) {
+  const cnt = (r) => p.sources.filter((s) => roleOf(s) === r).length;
+  const parts = [cnt('broll') ? `🎞 перебивки: ${cnt('broll')}` : '', cnt('talk') ? `🎤 с речью: ${cnt('talk')}` : '', cnt('voice') ? `🎙 голос: ${cnt('voice')}` : ''].filter(Boolean);
+  return parts.length ? parts.join(' · ') : 'пока ничего';
 }
 
 function stageText(user, p) {
   const st = stageOf(p);
-  const head = `${stageDots(STAGE_NO[st])}\n<b>Этап ${STAGE_NO[st]} из 4 · ${STAGE_NAME[st]}</b>\n\n`;
-  if (st === 'talk') {
-    return head + `Пришлите сюда то, что должно звучать в ролике:
-🎤 <b>видео, где вы говорите</b> в камеру — можно несколько файлов и дублей, лучший выберу сам;
-🎙 <b>голосовое сообщение</b> — зажмите микрофон внизу чата и наговорите текст (или пришлите аудиофайл). Под него я подберу картинку.
+  const head = `${stageDots(STAGE_NO[st])}\n<b>Этап ${STAGE_NO[st]} из 3 · ${STAGE_NAME[st]}</b>\n\n`;
+  if (isUpload(st)) {
+    const what = {
+      broll: `Сейчас загружаем: <b>🎞 перебивки</b>.
+Видео для картинки: продукт, процесс, место, детали, люди. Звук и речь в них не слушаю. Разберу их, когда нажмёте «Дальше».
+💡 Видео, снятые в 60 кадров/с, смогу плавно замедлить.`,
+      talk: `Сейчас загружаем: <b>🎤 видео с речью</b>.
+Видео, где вы говорите в камеру — речь из них войдёт в ролик. Можно несколько файлов и дублей, лучший выберу сам.`,
+      voice: `Сейчас загружаем: <b>🎙 голос</b>.
+Зажмите микрофон внизу чата и наговорите текст (или пришлите аудиофайл). Под голос я подберу картинку из перебивок.`,
+    }[st];
+    return head + `${what}
 
-Можно и видео, и голосовое вместе. Речи в ролике не будет — сразу жмите «Дальше».
+<b>Уже загружено:</b> ${loadedLine(p)}
 
-⏳ Пришлите все файлы и <b>дождитесь моей сводки</b> «Исходников: …» — в ней будет кнопка «Дальше».`;
-  }
-  if (st === 'broll') {
-    return head + `Пришлите видео, которые пойдут картинкой: продукт, процесс, место, детали, люди. Звук и речь в них я не слушаю.
-💡 Видео, снятые в 60 кадров/с, смогу плавно замедлить.
-
-Сейчас только принимаю файлы — разберу их, когда нажмёте «Дальше». Перебивок нет — тоже жмите «Дальше».
-
-⏳ Пришлите все перебивки и <b>дождитесь моей сводки</b> «Исходников: …» — в ней будет кнопка «Дальше».`;
+Чтобы загружать другое — нажмите кнопку ниже. Голосовое я в любом режиме считаю голосом.
+⏳ Пришлите файлы и <b>дождитесь моей сводки</b> «Исходников: …», затем жмите «Дальше: пожелания».`;
   }
   if (st === 'brief') {
     const had = p.brief.length ? `\n\nУже записано:\n${p.brief.map((t) => `• ${esc(t)}`).join('\n')}` : '';
@@ -1528,27 +1639,31 @@ function readyText(user, p) {
   const cnt = (r) => p.sources.filter((s) => roleOf(s) === r).length;
   const src = [cnt('talk') ? `🎤 с речью: ${cnt('talk')}` : '', cnt('voice') ? `🎙 озвучка: ${cnt('voice')}` : '', cnt('broll') ? `🎞 перебивки: ${cnt('broll')}` : ''].filter(Boolean).join(' · ');
   const wishes = p.brief.length ? p.brief.map((t) => `• ${esc(t)}`).join('\n') : `🎨 на выбор ИИ — по вашему паспорту стиля${creativeOn(user) ? ' и с усилением ради удержания' : ''}`;
+  const libN = libraryCount(user);
+  const lib = libN
+    ? `\n📚 <b>Медиатека:</b> ${p.useLibrary ? `включена — могу брать перебивки из ваших прошлых видео (${libN})` : `выключена. В ней ${libN} ${plural(libN, 'видео', 'видео', 'видео')} из прошлых роликов — включите, если для этого ролика они подходят`}`
+    : '';
   const est = estimateCost(user);
   const wait = p.sources.some((s) => needsAnalysis(user, s) && !s.aiError) ? '\n⏳ Ещё разбираю исходники — можно нажать «Смонтировать» сейчас: начну, как только закончу.' : '';
-  return `${stageDots(4)}
-<b>Этап 4 из 4 · Монтаж</b>
+  return `${stageDots(3)}
+<b>Этап 3 из 3 · Монтаж</b>
 
 <b>Исходники:</b> ${src || 'нет'}
 <b>Пожелания:</b>
-${wishes}
+${wishes}${lib}
 
 💰 <b>Прогноз расхода на ИИ:</b> ≈${fmtUsd(est.low)}–${fmtUsd(est.high)}. ${esc(est.note)}${wait}
 
 Нажмите «▶️ Смонтировать». Готовый ролик придёт сюда, правки пишите обычным сообщением — у каждой правки будет своя цена.`;
 }
 
-/** Начать новый ролик: вводная про 4 этапа + первый этап */
+/** Начать новый ролик: вводная про 3 этапа + первый этап */
 async function startWizard(user, chatId, extra = '') {
   const p = user.project || newProject(user);
   p.stage = 'talk';
   await saveUser(user);
   await send(chatId, introText(user, p, extra));
-  await send(chatId, stageText(user, p), { reply_markup: stageKb(p) });
+  await send(chatId, stageText(user, p), { reply_markup: stageKb(p, user) });
 }
 
 /** Сменить этап. Уходя с этапа перебивок — запускаем их разбор в фоне. */
@@ -1557,12 +1672,14 @@ async function setStage(user, chatId, stage) {
   if (stage === 'ready' && !p.sources.length && !(pending.get(user.id) || 0)) {
     p.stage = 'talk';
     await saveUser(user);
-    return send(chatId, '⚠️ Для монтажа нужен хотя бы один файл. Начнём с этапа 1.\n\n' + stageText(user, p), { reply_markup: stageKb(p) });
+    return send(chatId, '⚠️ Для монтажа нужен хотя бы один файл. Вернёмся к материалам.\n\n' + stageText(user, p), { reply_markup: stageKb(p, user) });
   }
-  p.stage = stage; // файлы, присланные с этого момента, уже идут в новый этап
+  if (stage === 'up') stage = isUpload(p.upMode) ? p.upMode : 'talk'; // «назад к материалам» — в последний режим
+  if (isUpload(stage)) p.upMode = stage;
+  p.stage = stage; // файлы, присланные с этого момента, уже идут в новый режим или этап
   p.summarySig = '';
-  if (STAGE_NO[stage] > 2) await kickDeferred(user, chatId);
-  if (isBusy(user)) {
+  if (!isUpload(stage)) await kickDeferred(user, chatId);
+  if (!isUpload(stage) && isBusy(user)) {
     // следующий шаг покажем, только когда всё присланное обработано
     p.nextStage = stage;
     await saveUser(user);
@@ -1570,10 +1687,10 @@ async function setStage(user, chatId, stage) {
   }
   delete p.nextStage;
   await saveUser(user);
-  await send(chatId, stageText(user, p), { reply_markup: stageKb(p) });
+  await send(chatId, stageText(user, p), { reply_markup: stageKb(p, user) });
 }
 
-/** Перебивки этапа 2 принимаются без ИИ; разбираем их одним заходом, когда этап закончен */
+/** Перебивки принимаются без ИИ; разбираем их одним заходом, когда этап «Материалы» закончен */
 const kicked = new Set();
 async function kickDeferred(user, chatId) {
   const p = user.project;
@@ -1649,14 +1766,24 @@ async function afterSources(user, chatId) {
   const what = [cnt('talk') ? `с речью: ${cnt('talk')}` : '', cnt('broll') ? `перебивки: ${cnt('broll')}` : '', cnt('voice') ? `озвучка: ${cnt('voice')}` : ''].filter(Boolean).join(', ');
   await send(
     chatId,
-    `Исходников: <b>${p.sources.length}</b> (${what}).\n${stageLine(p)}\n${{ talk: 'Можно прислать ещё видео с речью или голосовое. Всё — жмите «Дальше».', broll: 'Можно прислать ещё перебивки. Всё — жмите «Дальше».', brief: 'Напишите пожелания или жмите кнопку ниже.', ready: 'Файл добавлен. Можно монтировать.' }[stageOf(p)]}`,
-    { reply_markup: montageKb(p) }
+    `Исходников: <b>${p.sources.length}</b> (${what}).\n${stageLine(p)}\n${{ talk: 'Можно прислать ещё или переключить, что загружаете. Всё — жмите «Дальше: пожелания».', broll: 'Можно прислать ещё или переключить, что загружаете. Всё — жмите «Дальше: пожелания».', voice: 'Можно прислать ещё или переключить, что загружаете. Всё — жмите «Дальше: пожелания».', brief: 'Напишите пожелания или жмите кнопку ниже.', ready: 'Файл добавлен. Можно монтировать.' }[stageOf(p)]}`,
+    { reply_markup: montageKb(p, user) }
   );
 }
 
 // ───────────────────────────── План монтажа ─────────────────────────────
 
 /** Что есть в проекте: фразы речи (основа ролика) и планы для перебивок */
+/** Видео из медиатеки, которые можно взять в текущий ролик */
+function libraryFor(user) {
+  const p = user.project;
+  if (!p || !p.useLibrary) return [];
+  const inProj = new Set(p.sources.map((s) => s.lid).filter(Boolean));
+  return (user.library || [])
+    .filter((e) => !inProj.has(e.lid) && e.kind === 'video' && e.ai && Array.isArray(e.ai.shots) && e.ai.shots.some((x) => x.kind === 'broll') && fs.existsSync(path.join(libDir(user), e.file)))
+    .reverse(); // сначала самые свежие
+}
+
 function projectContext(user) {
   const p = user.project;
   const has = (s) => s.ai && s.ai.phrases && s.ai.phrases.length;
@@ -1677,6 +1804,19 @@ function projectContext(user) {
   const visual = !phrases.length;
   if ((voiceover || visual) && !shots.length) shots = allShots.filter((s) => s.kind !== 'junk');
   if ((voiceover || visual) && !shots.length) shots = allShots;
+  // Медиатека: перебивки из прошлых видео автора (если он разрешил для этого ролика)
+  const libItems = libraryFor(user);
+  const libShots = [];
+  for (const e of libItems) {
+    for (const [k, x] of e.ai.shots.entries()) {
+      if (x.kind !== 'broll' || x.quality === 'bad') continue;
+      if (libShots.length >= CFG.libShotsMax) break;
+      libShots.push({ ...x, id: `L${e.lid}#${k + 1}`, src: `L${e.lid}`, slowMax: slowMaxOf(e), lib: true });
+    }
+  }
+  shots = [...shots, ...libShots];
+  const bySrc = new Map(p.sources.map((s) => [s.n, { ...s, path: srcPath(user, s) }]));
+  for (const e of libItems) bySrc.set(`L${e.lid}`, { ...e, n: `L${e.lid}`, path: path.join(libDir(user), e.file) });
   return {
     voiceover,
     talk,
@@ -1685,7 +1825,8 @@ function projectContext(user) {
     phrases,
     shots,
     fps,
-    bySrc: new Map(p.sources.map((s) => [s.n, s])),
+    libItems: libItems.filter((e) => libShots.some((x) => x.src === `L${e.lid}`)),
+    bySrc,
     slowable: shots.some((x) => x.slowMax > 1),
     phraseById: new Map(phrases.map((x) => [x.id, x])),
     shotById: new Map(shots.map((x) => [x.id, x])),
@@ -1725,14 +1866,19 @@ function measuredLine(user) {
   return `Измерено по готовым роликам автора: длина обычно ${num(m.durMedian, 0)} с (от ${num(m.durMin, 0)} до ${num(m.durMax, 0)}), склейка в среднем каждые ${num(m.shotAvg)} с, первый план ≈${num(m.firstShot)} с, кадр ${m.orientation || 'вертикальный'}.`;
 }
 
+function libraryNote(ctx) {
+  if (!ctx.libItems || !ctx.libItems.length) return '';
+  return `Медиатека автора — видео из его прошлых роликов (планы с id на «L» и пометкой «медиатека»). Бери их, только если они подходят по смыслу; свои исходники этого ролика в приоритете. О чём эти видео:\n${ctx.libItems.map((e) => `L${e.lid} (ролик №${e.project}, ${fmtDur(e.duration)}): ${libSummary(e) || 'без описания'}`).join('\n')}\n\n`;
+}
+
 function catalogText(ctx) {
   const tag = (x) => (ctx.hybrid ? ` | ${x.voice ? 'озвучка' : 'в кадре'}` : '');
   const ph = ctx.phrases.map((x) => `${x.id}${tag(x)} | ${r2(x.start)}–${r2(x.end)} | ${num(x.end - x.start)} с | ${x.text}`).join('\n');
-  const sh = ctx.shots.map((x) => `${x.id} | ${r2(x.start)}–${r2(x.end)} (${num(x.end - x.start)} с) | ${x.kind}, ${x.quality}${x.slowMax > 1 ? `, можно замедлить ×${x.slowMax}` : ''} | ${x.what}`).join('\n');
-  return `Фразы речи (id${ctx.hybrid ? ' | откуда: в кадре — автор говорит на видео, озвучка — закадровый голос' : ''} | секунды в исходнике | длительность | текст):\n${ph}\n\nПланы видео для перебивок (id | секунды | вид, качество | что в кадре):\n${sh || 'нет'}`;
+  const sh = ctx.shots.map((x) => `${x.id} | ${r2(x.start)}–${r2(x.end)} (${num(x.end - x.start)} с) | ${x.kind}, ${x.quality}${x.slowMax > 1 ? `, можно замедлить ×${x.slowMax}` : ''}${x.lib ? ', медиатека' : ''} | ${x.what}`).join('\n');
+  return `${libraryNote(ctx)}Фразы речи (id${ctx.hybrid ? ' | откуда: в кадре — автор говорит на видео, озвучка — закадровый голос' : ''} | секунды в исходнике | длительность | текст):\n${ph}\n\nПланы видео для перебивок (id | секунды | вид, качество | что в кадре):\n${sh || 'нет'}`;
 }
 
-const PLAN_SCHEMA = `{"idea": "о чём ролик, одна фраза", "keep": ["1.3", "1.5"], "broll": [{"phrase": "1.5", "shot": "2#3", "offset": 0.5, "dur": 2}], "cover": [{"phrase": "3.1", "shots": ["1#2", "2#5"]}], "zoom": ["1.3"], "jumpcut_zoom": false, "cut_pauses": true, "slow": ["2#3"], "subtitles": {"on": true, "position": "bottom", "size": "medium", "color": "#FFFFFF", "highlight": "#FFD400", "uppercase": false, "words": 3, "style": "outline"}, "notes": ["..."]}`;
+const PLAN_SCHEMA = `{"idea": "о чём ролик, одна фраза", "keep": ["1.3", "1.5"], "broll": [{"phrase": "1.5", "shot": "2#3", "offset": 0.5, "dur": 2}], "cover": [{"phrase": "3.1", "shots": ["1#2", "2#5"]}], "zoom": ["1.3"], "jumpcut_zoom": false, "cut_pauses": true, "cut_cover": 1, "slow": ["2#3"], "subtitles": {"on": true, "position": "bottom", "size": "medium", "color": "#FFFFFF", "highlight": "#FFD400", "uppercase": false, "words": 3, "style": "outline"}, "notes": ["..."]}`;
 
 const VISUAL_SCHEMA = `{"idea": "о чём ролик, одна фраза", "sequence": [{"shot": "1#2", "dur": 1.5}, {"shot": "3#1", "dur": 2}], "slow": ["3#1"], "keep_sound": true, "notes": ["..."]}`;
 
@@ -1745,8 +1891,8 @@ ${measuredLine(user)}
 
 ${creativeBlock(user, ctx)}
 ${wishes ? `\nПожелания автора к этому ролику (они важнее паспорта):\n${wishes}\n` : ''}
-Планы видео (id | секунды | вид, качество | что в кадре):
-${ctx.shots.map((x) => `${x.id} | ${r2(x.start)}–${r2(x.end)} (${num(x.end - x.start)} с) | ${x.kind}, ${x.quality}${x.slowMax > 1 ? `, можно замедлить ×${x.slowMax}` : ''} | ${x.what}`).join('\n')}
+${libraryNote(ctx)}Планы видео (id | секунды | вид, качество | что в кадре):
+${ctx.shots.map((x) => `${x.id} | ${r2(x.start)}–${r2(x.end)} (${num(x.end - x.start)} с) | ${x.kind}, ${x.quality}${x.slowMax > 1 ? `, можно замедлить ×${x.slowMax}` : ''}${x.lib ? ', медиатека' : ''} | ${x.what}`).join('\n')}
 
 Как собирать:
 1. "sequence" — планы в порядке показа и длительность каждого в секундах (dur не больше длины плана). Начни с самого цепляющего кадра. Темп и длина ролика — как у автора, если в пожеланиях не сказано иначе. Брак и слабые планы не бери. Один план — один раз.
@@ -1806,6 +1952,7 @@ ${catalogText(ctx)}
 3. "zoom" — id фраз, где сделать приближение на говорящего, если автор так делает. Иначе пустой список.
 4. "jumpcut_zoom" — true, если автор прячет склейки внутри речи сменой крупности.
 5. "cut_pauses" — true, если автор вырезает паузы в речи.
+5b. "cut_cover" — сколько секунд перебивки ставить до и после каждой склейки внутри речи в кадре, чтобы спрятать скачок картинки (вырезанная пауза, смена дубля). Обычно 1; 0,5 — если темп быстрый; до 2 — если перебивок много и они красивые; 0 — если автор нарочно оставляет jump cut. Бот сам подставит перебивки в эти места.
 5a. "slow" — ${ctx.slowable ? 'Планы с пометкой «можно замедлить» сняты на 60 кадров и больше: их можно показать плавно замедленными, перечислив id в "slow". Замедление — инструмент: продлить удачный кадр, закрыть нехватку видео, подчеркнуть деталь, если это в духе автора. Замедленный план занимает в ролике во столько же раз больше времени (dur считай по ролику, не по исходнику). Речь в кадре не замедляется — только перебивки и планы из "cover".' : 'оставь пустым: исходники сняты на 30 кадров, плавно замедлить их нельзя.'}
 6. "subtitles" — субтитры по паспорту: on (есть ли вообще), position (bottom | middle | top), size (small | medium | large), color (#RRGGBB), highlight (#RRGGBB — цвет выделенного слова, или "" если автор не выделяет), uppercase (true/false), words (сколько слов на экране за раз, 1–6), style (outline — обводка | box — плашка | shadow — тень).
 7. "notes" — 2–5 коротких пунктов для автора: что сделано и почему.
@@ -1823,7 +1970,7 @@ function modeLine(ctx) {
 /** План в том виде, в котором его видит ИИ */
 function planForAi(plan) {
   if (plan.sequence && plan.sequence.length) return { idea: plan.idea, sequence: plan.sequence, slow: plan.slow, keep_sound: plan.keepSound };
-  return { idea: plan.idea, keep: plan.keep, broll: plan.broll, cover: plan.cover, zoom: plan.zoom, jumpcut_zoom: plan.jumpcutZoom, cut_pauses: plan.cutPauses, slow: plan.slow, subtitles: plan.subtitles };
+  return { idea: plan.idea, keep: plan.keep, broll: plan.broll, cover: plan.cover, zoom: plan.zoom, jumpcut_zoom: plan.jumpcutZoom, cut_pauses: plan.cutPauses, cut_cover: plan.cutCover, slow: plan.slow, subtitles: plan.subtitles };
 }
 
 function promptFix(user, ctx, text) {
@@ -1899,7 +2046,8 @@ function normalizePlan(raw, ctx) {
     style: ['outline', 'box', 'shadow'].includes(s.style) ? s.style : 'outline',
   };
   const notes = (Array.isArray(r.notes) ? r.notes : []).map(txt).filter(Boolean).slice(0, 6);
-  return { idea: txt(r.idea).slice(0, 300), keep, broll, cover, zoom, jumpcutZoom: r.jumpcut_zoom === true, cutPauses: r.cut_pauses !== false, slow, subtitles, notes };
+  const cutCover = r.cut_cover != null && isFinite(Number(r.cut_cover)) ? clamp(Number(r.cut_cover), 0, 3) : null;
+  return { idea: txt(r.idea).slice(0, 300), keep, broll, cover, zoom, jumpcutZoom: r.jumpcut_zoom === true, cutPauses: r.cut_pauses !== false, cutCover, slow, subtitles, notes };
 }
 
 // ───────────────────────────── Монтажный лист ─────────────────────────────
@@ -2050,6 +2198,47 @@ function buildTimeline(plan, ctx, fps = ctx.fps || CFG.fps) {
     if (g0 >= total || len < Math.round(0.4 * fps)) continue;
     pieces = overlayPiece(pieces, { f0: g0, f1: g0 + len, src: shot.src, from, zoom: 1, broll: true, slow }, fps);
   }
+  // Склейки внутри речи в кадре (вырезанная пауза, другой дубль) прячем под перебивку: ~1 с до и после разреза
+  let hidden = 0;
+  const coverSec = plan.cutCover == null ? CFG.cutCover : plan.cutCover;
+  const pool = [...ctx.shots].sort((a, b) => (a.quality === 'good' ? 0 : 1) - (b.quality === 'good' ? 0 : 1) || (a.lib ? 1 : 0) - (b.lib ? 1 : 0));
+  if (coverSec > 0 && pool.length) {
+    const cuts = [];
+    let last = null;
+    for (const c of chunks) {
+      if (ctx.phraseById.get(c.phrase).voice) {
+        last = null;
+        continue;
+      }
+      if (last && (last.src !== c.src || Math.abs(last.a + (last.f1 - last.f0) / fps - c.a) > 0.05)) cuts.push(c.f0);
+      last = c;
+    }
+    const half = Math.round(coverSec * fps);
+    const underBroll = (f) => pieces.some((pc) => pc.broll && pc.f0 <= f - 2 && pc.f1 >= f + 2);
+    const ivs = [];
+    for (const f of cuts) {
+      if (underBroll(f)) continue;
+      const a = Math.max(0, f - half);
+      const b = Math.min(total, f + half);
+      const prevIv = ivs[ivs.length - 1];
+      if (prevIv && a - prevIv[1] < Math.round(0.4 * fps)) prevIv[1] = b; // близкие склейки — одна перебивка
+      else ivs.push([a, b]);
+    }
+    let k = 0;
+    for (const [a, b] of ivs) {
+      let g = a;
+      let guard = 0;
+      while (g < b && guard++ < pool.length * 2) {
+        const shot = pool[k++ % pool.length];
+        const slow = slowOf(shot);
+        const len = Math.min(b - g, Math.floor((shot.end - shot.start) * slow * fps));
+        if (len < 3) continue;
+        pieces = overlayPiece(pieces, { f0: g, f1: g + len, src: shot.src, from: centered(shot, len / fps), zoom: 1, broll: true, slow, hide: true }, fps);
+        g += len;
+      }
+      hidden++;
+    }
+  }
   // Озвучка: планы, подобранные ИИ, делят фразу поровну
   for (const c of plan.cover) {
     const sp = span.get(c.phrase);
@@ -2088,7 +2277,7 @@ function buildTimeline(plan, ctx, fps = ctx.fps || CFG.fps) {
     }
     pieces = fillGaps(pieces, total, fps);
   }
-  return { chunks, pieces: mergePieces(pieces, fps), total, span, fps };
+  return { chunks, pieces: mergePieces(pieces, fps), total, span, fps, hidden };
 }
 
 // ───────────────────────────── Субтитры ─────────────────────────────
@@ -2227,7 +2416,7 @@ async function renderMontage(user, ctx, plan, say) {
   const [W, H] = outputSize(user, ctx);
   const tl = buildTimeline(plan, ctx, fps);
   if (process.env.DEBUG_TL) log('timeline:', JSON.stringify(tl.pieces.map((x) => ({ f0: x.f0, f1: x.f1, src: x.src, from: r2(x.from), slow: x.slow || 1, z: x.zoom }))));
-  const srcFile = (n) => path.join(dir, ctx.bySrc.get(n).file);
+  const srcFile = (n) => ctx.bySrc.get(n).path;
   const list = (files) => files.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n');
   try {
     // 1. Звук: куски речи подряд, с короткими фейдами на стыках
@@ -2299,7 +2488,7 @@ async function renderMontage(user, ctx, plan, say) {
       'собрать итоговый ролик'
     );
     await checkSmooth(out, tl.total, fps);
-    return { v: p.version, visual: !!ctx.visual, file: path.basename(out), duration: tl.total / fps, width: W, height: H, fps, chunks: tl.chunks.length, broll: tl.pieces.filter((x) => x.broll).length, slow: tl.pieces.filter((x) => (x.slow || 1) > 1).length, subsNote, at: new Date().toISOString() };
+    return { v: p.version, visual: !!ctx.visual, file: path.basename(out), duration: tl.total / fps, width: W, height: H, fps, chunks: tl.chunks.length, broll: tl.pieces.filter((x) => x.broll).length, hidden: tl.hidden || 0, lib: tl.pieces.filter((x) => typeof x.src === 'string').length, slow: tl.pieces.filter((x) => (x.slow || 1) > 1).length, subsNote, at: new Date().toISOString() };
   } finally {
     await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
   }
@@ -2343,7 +2532,7 @@ function resultCaption(p, extraNote) {
   if (r.kind === 'fix' && r.fixText) L.push(`✏️ Правка к варианту ${r.from}: «${esc(r.fixText.slice(0, 120))}»`);
   else if (r.kind === 'variant') L.push(`🔄 Другая версия (на основе варианта ${r.from})`);
   if (plan.idea) L.push(esc(plan.idea));
-  const facts = (r.visual ? [`планов: ${r.chunks}`, 'без речи', plan.keepSound ? 'живой звук' : 'без звука — под музыку'] : [`кусков речи: ${r.chunks}`, r.broll ? `перебивок: ${r.broll}` : '', plan.subtitles.on ? 'субтитры: да' : 'без субтитров']).concat(r.slow ? [`замедлений: ${r.slow}`] : []).filter(Boolean);
+  const facts = (r.visual ? [`планов: ${r.chunks}`, 'без речи', plan.keepSound ? 'живой звук' : 'без звука — под музыку'] : [`кусков речи: ${r.chunks}`, r.broll ? `перебивок: ${r.broll}` : '', plan.subtitles.on ? 'субтитры: да' : 'без субтитров']).concat(r.hidden ? [`склеек спрятано: ${r.hidden}`] : [], r.lib ? [`из медиатеки: ${r.lib}`] : [], r.slow ? [`замедлений: ${r.slow}`] : []).filter(Boolean);
   L.push(facts.join(' · '));
   if (r.cost) L.push(`💰 Этот вариант: ≈${fmtUsd(r.cost.usd)} (запросов ИИ: ${r.cost.calls}) · всего по ролику: ≈${fmtUsd(usdOf(spendOf(p)))}`);
   for (const n of plan.notes.slice(0, 4)) L.push(`• ${esc(n)}`);
@@ -2371,6 +2560,13 @@ async function makeMontage(user, chatId, fixText, opts = {}) {
   if (!user.passport) return void (await send(chatId, 'Сначала научите меня своему стилю: /learn'));
   if (!p || !p.sources.length) return void (await send(chatId, 'Пришлите исходники ролика: видео, перебивки, озвучку.'));
   if (fixText && !p.plan) fixText = '';
+  // старый ролик: часть файлов могла уйти из медиатеки по лимиту места
+  const gone = p.sources.filter((x) => !fs.existsSync(srcPath(user, x)));
+  if (gone.length) {
+    p.sources = p.sources.filter((x) => !gone.includes(x));
+    await send(chatId, `⚠️ Файлов ${gone.map((x) => x.n).join(', ')} этого ролика уже нет на сервере (освобождалось место). Монтирую из оставшихся.`);
+    if (!p.sources.length) return void (await send(chatId, 'Исходников этого ролика не осталось. Начните новый ролик: /new'));
+  }
   const spent0 = snapSpend(p);
   const st = await progress(user, chatId, fixText ? '✏️ Вношу правку…' : opts.variant ? '🔄 Делаю другой вариант…' : '🎬 Начинаю монтаж…');
   const say = (t) => st.set(t);
@@ -2476,13 +2672,12 @@ const HELLO = `Привет! Я Магическая кастрюля — мон
 2. Я разберу их и покажу «паспорт стиля» — как я понял вашу манеру.
 3. Подтвердите паспорт или поправьте его сообщением: «субтитры у меня всегда жёлтые».
 
-<b>Монтаж</b> (/edit или /new) — 4 этапа, на каждом подскажу, что делать:
-1. Речь: видео, где вы говорите, и/или голосовое с закадровым текстом.
-2. Перебивки: видео для картинки — продукт, процесс, место.
-3. Пожелания к ролику — или «на выбор ИИ».
-4. Монтаж: покажу цену, смонтирую, правки — сообщением.
+<b>Монтаж</b> (/edit или /new) — 3 этапа:
+1. Материалы: кнопкой выбираете, что загружаете — перебивки, видео с речью или голос, в любом порядке.
+2. Пожелания к ролику — или «на выбор ИИ».
+3. Монтаж: покажу цену, смонтирую, правки — сообщением.
 
-Команды: /status — что загружено, /style — паспорт, /new — новый ролик, /history — готовые ролики, /reset — удалить всё.`;
+Команды: /status — что загружено, /style — паспорт, /new — новый ролик, /history — готовые ролики, /library — медиатека, /reset — удалить всё.`;
 
 
 
@@ -2617,7 +2812,7 @@ async function onMessage(msg) {
     await saveUser(user);
     if (fresh) return void (await startWizard(user, chatId));
     if (user.project.result) return void (await send(chatId, `🎬 <b>Ролик №${user.project.id}</b> готов. Правки пишите сообщением, новый ролик — /new.`));
-    return void (await send(chatId, `🎬 <b>Продолжаем ролик №${user.project.id}.</b>\n\n` + stageText(user, user.project), { reply_markup: stageKb(user.project) }));
+    return void (await send(chatId, `🎬 <b>Продолжаем ролик №${user.project.id}.</b>\n\n` + stageText(user, user.project), { reply_markup: stageKb(user.project, user) }));
   }
   if (/^\/learn\b/.test(text)) {
     user.mode = 'learn';
@@ -2643,12 +2838,23 @@ async function onMessage(msg) {
     return void (await send(chatId, 'Удалить все примеры, паспорт стиля и правки? Вернуть их будет нельзя.', { reply_markup: kb([[['🗑 Да, удалить всё', 'reset_yes'], ['Отмена', 'cancel']]]) }));
   }
   if (/^\/history\b/.test(text)) return void (await showHistory(user, chatId));
+  if (/^\/library\b/.test(text)) return void (await showLibrary(user, chatId));
+  const libdel = text.match(/^\/libdel(?:@\w+)?\s*(\d+)?/);
+  if (libdel) {
+    const e = (user.library || []).find((x) => x.lid === Number(libdel[1]));
+    if (!e) return void (await send(chatId, 'Укажите номер из /library, например: /libdel 12'));
+    if (user.project && user.project.sources.some((x) => x.lid === e.lid)) return void (await send(chatId, 'Это видео — исходник текущего ролика. Сначала уберите его из ролика (/del) или начните новый ролик.'));
+    if (busy(user)) return void (await send(chatId, BUSY));
+    await removeFromLibrary(user, e);
+    await saveUser(user);
+    return void (await send(chatId, `Видео #${e.lid} удалено из медиатеки.`));
+  }
   if (/^\/creative\b/.test(text)) {
     user.creative = !creativeOn(user);
     await saveUser(user);
     return void (await send(chatId, user.creative ? '🎨 Творческая свобода <b>включена</b>: ИИ будет усиливать ролик ради удержания — крючок в начале, смена картинки каждые пару секунд, без воды. Выключить — /creative ещё раз.' : '📐 Творческая свобода <b>выключена</b>: ИИ строго следует паспорту и вашим пожеланиям. Включить — /creative.'));
   }
-  const role = text.match(/^\/(broll|talk)(?:@\w+)?\s*(\d+)?/);
+  const role = text.match(/^\/(broll|talk|voice)(?:@\w+)?\s*(\d+)?/);
   if (role) {
     if (!user.passport) return void (await send(chatId, 'Сначала научите меня своему стилю: /learn'));
     user.mode = 'edit';
@@ -2657,6 +2863,7 @@ async function onMessage(msg) {
     const p = user.project;
     const s = p && p.sources.find((x) => x.n === Number(role[2]));
     if (!s) return void (await send(chatId, `Укажите номер исходника из /status, например: /${stage} 2`));
+    if (stage === 'voice') return void (await send(chatId, 'Видео не может стать голосом. Переназначить можно так: /talk N — видео с речью, /broll N — перебивка.'));
     if (s.kind === 'audio') return void (await send(chatId, 'Озвучка — это всегда озвучка, её роль не меняется.'));
     if (busy(user)) return void (await send(chatId, BUSY));
     if (roleOf(s) === stage) return void (await send(chatId, sourceLine(s)));
@@ -2671,7 +2878,7 @@ async function onMessage(msg) {
     if (!s) return void (await send(chatId, 'Укажите номер исходника из /status, например: /del 2'));
     if (busy(user)) return void (await send(chatId, BUSY));
     p.sources = p.sources.filter((x) => x !== s);
-    for (const f of [s.file, s.wav]) if (f) await fsp.unlink(path.join(projDir(user), f)).catch(() => {});
+    if (!s.lib) for (const f of [s.file, s.wav]) if (f) await fsp.unlink(path.join(projDir(user), f)).catch(() => {}); // из медиатеки файл не удаляем
     await saveUser(user);
     return void (await send(chatId, `Исходник ${s.n} убран.`));
   }
@@ -2683,7 +2890,7 @@ async function onMessage(msg) {
     await saveUser(user);
     return void (await send(chatId, `Пример ${ex.n} убран.${user.passport ? ' Чтобы паспорт это учёл, пересоберите его: /style → «Пересобрать».' : ''}`));
   }
-  if (text.startsWith('/')) return void (await send(chatId, 'Не знаю такой команды. Есть /status, /style, /edit, /learn, /new, /history, /broll, /talk, /creative, /reset и /help.'));
+  if (text.startsWith('/')) return void (await send(chatId, 'Не знаю такой команды. Есть /status, /style, /edit, /learn, /new, /history, /library, /broll, /talk, /creative, /reset и /help.'));
 
   if (/instagram\.com|instagr\.am/i.test(text)) return void (await send(chatId, HOW_TO_SAVE));
 
@@ -2701,13 +2908,12 @@ async function onMessage(msg) {
     p.brief.push(text);
     await saveUser(user);
     const st = stageOf(p);
-    const tail = {
-      talk: `Учту на этапе монтажа. А сейчас — ${stageLine(p).replace(/^\S+ Сейчас: /, '')}: пришлите видео с речью или голосовое, либо жмите «Дальше».`,
-      broll: `Учту на этапе монтажа. А сейчас — ${stageLine(p).replace(/^\S+ Сейчас: /, '')}: пришлите перебивки или жмите «Дальше».`,
-      brief: 'Ещё пожелание — пишите следующим сообщением. Всё — жмите «Дальше: монтаж».',
-      ready: 'Учту при монтаже.',
-    }[st];
-    return void (await send(chatId, `✍️ Записал пожелание: «${esc(text)}».\n${tail}`, { reply_markup: stageKb(p) }));
+    const tail = isUpload(st)
+      ? `Учту на этапе монтажа. А сейчас загружаем ${UP_NAME[st]}: присылайте файлы или жмите «Дальше: пожелания».`
+      : st === 'brief'
+        ? 'Ещё пожелание — пишите следующим сообщением. Всё — жмите «Дальше: монтаж».'
+        : 'Учту при монтаже.';
+    return void (await send(chatId, `✍️ Записал пожелание: «${esc(text)}».\n${tail}`, { reply_markup: stageKb(p, user) }));
   }
 
   if (text) {
@@ -2737,7 +2943,7 @@ async function onSourceMedia(user, chatId, m) {
     user.replace = null;
     p.open = true;
   }
-  if (!m.role) m.role = m.kind === 'audio' ? 'voice' : stageOf(p) === 'talk' ? 'talk' : 'broll';
+  if (!m.role) m.role = m.kind === 'audio' ? 'voice' : ['talk', 'voice'].includes(stageOf(p)) ? 'talk' : 'broll';
   // К готовому ролику прислали ещё файлы — спрашиваем, к какому ролику они
   if (p.result && !p.open) {
     user.hold = user.hold || [];
@@ -2781,6 +2987,17 @@ function fmtWhen(iso) {
 }
 
 const allProjects = (user) => [user.project, ...(user.archive || [])].filter((p) => p && ensureHistory(p).length);
+
+async function showLibrary(user, chatId) {
+  const lib = user.library || [];
+  if (!lib.length) return send(chatId, '📚 Медиатека пуста. Всё, что вы присылаете для роликов, будет сохраняться здесь вместе с разбором — и его можно будет взять в следующие ролики.');
+  const mb = lib.reduce((a, x) => a + (x.bytes || 0), 0) / 1e6;
+  const L = [`📚 <b>Медиатека</b>: ${lib.length} ${plural(lib.length, 'файл', 'файла', 'файлов')}, ${num(mb, 0)} МБ из ${CFG.libraryMaxMb} МБ\n`];
+  for (const e of lib.slice(-15).reverse()) L.push(`<b>#${e.lid}</b> · ${ROLE_ICON[e.role] || '🎞'} ${ROLE_NAME[e.role] || 'видео'} ${fmtDur(e.duration)} · ролик №${e.project}${libSummary(e) ? `\n    ${esc(libSummary(e).slice(0, 110))}` : ''}`);
+  if (lib.length > 15) L.push(`…и ещё ${lib.length - 15} (самые старые).`);
+  L.push('\nЧтобы ИИ брал перебивки отсюда, включите «📚 Медиатека» на этапе 4 перед монтажом. Удалить файл — /libdel и номер. Когда место кончается, самые старые файлы удаляются сами.');
+  return send(chatId, L.join('\n'), { reply_markup: kb([[['🗑 Очистить медиатеку', 'lib_clear']]]) });
+}
 
 async function showHistory(user, chatId) {
   const list = allProjects(user);
@@ -2841,7 +3058,7 @@ async function swapMenu(user, chatId) {
   const btns = p.sources.map((s) => [`${ROLE_ICON[roleOf(s)]} ${s.n}`, `sw:${s.n}`]);
   const rows = [];
   for (let i = 0; i < btns.length; i += 4) rows.push(btns.slice(i, i + 4));
-  rows.push([['➕ Добавить речь', 'add:talk'], ['➕ Добавить перебивки', 'add:broll']]);
+  rows.push([['➕ Перебивки', 'add:broll'], ['➕ Видео с речью', 'add:talk'], ['➕ Голос', 'add:voice']]);
   return send(chatId, L.join('\n'), { reply_markup: kb(rows) });
 }
 
@@ -2974,7 +3191,15 @@ async function onCallbackArg(user, chatId, q, done, dropButtons) {
       if (!p) return done();
       await done();
       p.open = true;
-      return setStage(user, chatId, a === 'broll' ? 'broll' : 'talk');
+      return setStage(user, chatId, isUpload(a) ? a : 'talk');
+    }
+    case 'up': {
+      if (!p || !isUpload(a)) return done();
+      if (p.result && !p.open) return done('Ролик уже смонтирован. Добавить файлы — «🔁 Заменить исходник» → «➕ Добавить»');
+      await done(`Загружаем: ${UP_NAME[a]}`);
+      await dropButtons();
+      user.mode = 'edit';
+      return setStage(user, chatId, a);
     }
   }
   return done();
@@ -2996,6 +3221,32 @@ async function onCallback(q) {
       await done();
       await showHistory(user, chatId);
       break;
+    case 'lib_t': {
+      const p = user.project;
+      if (!p) return done();
+      p.useLibrary = !p.useLibrary;
+      user.useLibraryDefault = p.useLibrary; // запомним выбор для следующих роликов
+      await saveUser(user);
+      await done(p.useLibrary ? 'Медиатека включена' : 'Медиатека выключена');
+      await dropButtons();
+      await setStage(user, chatId, stageOf(p));
+      break;
+    }
+    case 'lib_clear':
+      await done();
+      await send(chatId, 'Удалить из медиатеки все видео, которых нет в текущем ролике? Готовые ролики в истории останутся, но правки старых роликов могут перестать работать.', { reply_markup: kb([[['🗑 Да, очистить', 'lib_clear_yes'], ['Отмена', 'cancel']]]) });
+      break;
+    case 'lib_clear_yes': {
+      if (busy(user)) return done('Подождите, я ещё занят');
+      const inUse = new Set(((user.project && user.project.sources) || []).map((x) => x.lid));
+      const del = (user.library || []).filter((e) => !inUse.has(e.lid));
+      for (const e of del) await removeFromLibrary(user, e);
+      await saveUser(user);
+      await done('Очищено');
+      await dropButtons();
+      await send(chatId, `🗑 Медиатека очищена: удалено ${del.length} ${plural(del.length, 'файл', 'файла', 'файлов')}.`);
+      break;
+    }
     case 'r_swap':
       await done();
       await swapMenu(user, chatId);
@@ -3046,6 +3297,8 @@ async function onCallback(q) {
       break;
     case 'st_talk':
     case 'st_broll':
+    case 'st_voice':
+    case 'st_up':
     case 'st_brief':
     case 'st_ready':
       await done();
@@ -3187,7 +3440,7 @@ async function recover() {
     user.live = [];
     const inbox = user.inbox || [];
     const p = user.project;
-    const unfinished = p ? p.sources.filter((s) => needsAnalysis(user, s) && !(roleOf(s) === 'broll' && stageOf(p) === 'broll')) : [];
+    const unfinished = p ? p.sources.filter((s) => needsAnalysis(user, s) && !(roleOf(s) === 'broll' && isUpload(stageOf(p)))) : [];
     await saveUser(user);
     if (!inbox.length && !unfinished.length && !wasMontage) {
       // ждал следующего этапа, а обрабатывать уже нечего — показываем этап
