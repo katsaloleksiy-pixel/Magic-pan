@@ -1348,7 +1348,8 @@ function sourceLine(src) {
     const b = ai.shots.filter((s) => s.kind === 'broll' && s.quality !== 'bad').length;
     parts.push(`${ai.shots.length} ${plural(ai.shots.length, 'план', 'плана', 'планов')}${b ? `, для перебивок: ${b}` : ''}`);
   }
-  if (src.fps >= CFG.fps * 2 - 1) parts.push(`${Math.round(src.fps)} fps — можно замедлять`);
+  if (src.fps >= 47) parts.push(`${Math.round(src.fps)} fps — можно замедлять`);
+  else if (src.fps && Math.round(src.fps) !== 30 && src.kind === 'video') parts.push(`${Math.round(src.fps)} fps`);
   return `${src.aiError ? '⚠️' : '✅'} ${parts.join(' · ')}`;
 }
 
@@ -1501,7 +1502,9 @@ function projectContext(user) {
   const hybrid = voiceover && talk;
   // Фразы в порядке исходников: сначала речь в кадре, затем озвучка; у каждой — откуда она
   const phrases = [...talkSrc, ...audio].flatMap((s) => s.ai.phrases.map((ph) => ({ ...ph, src: s.n, voice: s.kind === 'audio' })));
-  const slowMaxOf = (s) => clamp(Math.floor((s.fps || 0) / CFG.fps + 0.01), 1, 4);
+  // Частота итогового ролика — по исходникам: 25 fps в 30 не превратить без дёрганья (каждый пятый кадр — дубль)
+  const fps = projectFps(p.sources);
+  const slowMaxOf = (s) => clamp(Math.floor((s.fps || 0) / fps + 0.01), 1, 4);
   const allShots = p.sources.filter((s) => s.kind === 'video' && s.ai && s.ai.shots).flatMap((s) => s.ai.shots.map((x) => ({ ...x, src: s.n, slowMax: slowMaxOf(s) })));
   let shots = allShots.filter((s) => s.kind === 'broll' && s.quality !== 'bad');
   if (!shots.length) shots = allShots.filter((s) => s.kind === 'broll');
@@ -1516,11 +1519,31 @@ function projectContext(user) {
     visual,
     phrases,
     shots,
+    fps,
     bySrc: new Map(p.sources.map((s) => [s.n, s])),
     slowable: shots.some((x) => x.slowMax > 1),
     phraseById: new Map(phrases.map((x) => [x.id, x])),
     shotById: new Map(shots.map((x) => [x.id, x])),
   };
+}
+
+/**
+ * Базовая частота кадров ролика: 24, 25 или 30 — та, что у большей части видео по длительности
+ * (60 → 30, 50 → 25). Если исходники разные, побеждает самая «тяжёлая» по секундам.
+ */
+function projectFps(sources) {
+  const weight = new Map();
+  for (const s of sources) {
+    if (s.kind !== 'video' || !s.fps) continue;
+    let f = s.fps;
+    while (f > 31) f /= 2; // 60 → 30, 50 → 25, 120 → 30
+    const base = [24, 25, 30].reduce((b, c) => (Math.abs(c - f) < Math.abs(b - f) ? c : b), 30);
+    weight.set(base, (weight.get(base) || 0) + s.duration);
+  }
+  let best = CFG.fps;
+  let w = -1;
+  for (const [f, d] of weight) if (d > w) [best, w] = [f, d];
+  return best;
 }
 
 function passportBrief(user) {
@@ -1554,6 +1577,8 @@ function promptVisual(user, ctx, wishes) {
 Паспорт стиля (JSON):
 ${JSON.stringify(passportBrief(user))}
 ${measuredLine(user)}
+
+${creativeBlock(user, ctx)}
 ${wishes ? `\nПожелания автора к этому ролику (они важнее паспорта):\n${wishes}\n` : ''}
 Планы видео (id | секунды | вид, качество | что в кадре):
 ${ctx.shots.map((x) => `${x.id} | ${r2(x.start)}–${r2(x.end)} (${num(x.end - x.start)} с) | ${x.kind}, ${x.quality}${x.slowMax > 1 ? `, можно замедлить ×${x.slowMax}` : ''} | ${x.what}`).join('\n')}
@@ -1568,6 +1593,23 @@ ${ctx.shots.map((x) => `${x.id} | ${r2(x.start)}–${r2(x.end)} (${num(x.end - x
 ${VISUAL_SCHEMA}`;
 }
 
+const creativeOn = (user) => user.creative !== false;
+
+/** Блок про удержание: ИИ не только копирует стиль, но и усиливает ролик */
+function creativeBlock(user, ctx) {
+  if (!creativeOn(user)) return 'Творческая свобода выключена: строго следуй паспорту и пожеланиям, ничего не добавляй от себя.';
+  const tools = ctx.visual
+    ? 'порядок и длительность планов, замедление'
+    : `порядок фраз, отбор фраз, перебивки${ctx.voiceover ? ' и планы под озвучку' : ''}, наезды, замедление, субтитры`;
+  return `Творческая свобода (автор разрешил): ты не только повторяешь стиль автора, но и усиливаешь ролик ради удержания и вовлечённости — как опытный монтажёр коротких видео. Инструменты: ${tools}.
+- Первые 1–2 секунды — крючок: самая интригующая фраза, цифра, вопрос или самый сильный кадр. Приветствия и разгон («всем привет, сегодня расскажу…») убирай или переноси в конец.
+- Каждые 2–4 секунды в кадре что-то меняется: перебивка, наезд, смена плана, замедление. Без мельтешения и в духе автора.
+- Вырезай всё, что не двигает историю: повторы, «ну», «вот», «короче», затянутые концовки.
+- Финал — на сильной мысли, выводе или призыве, а не на «ну вот как-то так».
+- Паспорт — основа. Ради удержания можно отойти от него в деталях, но стиль автора должен остаться узнаваемым.
+В "notes" отдельным пунктом скажи, что сделано ради удержания.`;
+}
+
 function promptPlan(user, ctx) {
   const p = user.project;
   const wishes = [...p.brief, ...p.fixes].map((t, i) => `${i + 1}. ${t}`).join('\n');
@@ -1579,6 +1621,8 @@ ${JSON.stringify(passportBrief(user))}
 ${measuredLine(user)}
 
 Режим: ${modeLine(ctx)}
+
+${creativeBlock(user, ctx)}
 ${wishes ? `\nПожелания автора к этому ролику (они важнее паспорта):\n${wishes}\n` : ''}
 ${catalogText(ctx)}
 
@@ -1758,7 +1802,7 @@ function mergePieces(pieces, fps) {
  * Монтажный лист: звук — куски фраз подряд, картинка — список планов.
  * Время считается в кадрах, чтобы звук и картинка не разъезжались.
  */
-function buildTimeline(plan, ctx, fps = CFG.fps) {
+function buildTimeline(plan, ctx, fps = ctx.fps || CFG.fps) {
   const chunks = [];
   const span = new Map();
   let f = 0;
@@ -2008,9 +2052,10 @@ async function renderMontage(user, ctx, plan, say) {
   const work = path.join(dir, 'render');
   await fsp.rm(work, { recursive: true, force: true });
   await fsp.mkdir(work, { recursive: true });
-  const fps = CFG.fps;
+  const fps = ctx.fps || CFG.fps;
   const [W, H] = outputSize(user, ctx);
   const tl = buildTimeline(plan, ctx, fps);
+  if (process.env.DEBUG_TL) log('timeline:', JSON.stringify(tl.pieces.map((x) => ({ f0: x.f0, f1: x.f1, src: x.src, from: r2(x.from), slow: x.slow || 1, z: x.zoom }))));
   const srcFile = (n) => path.join(dir, ctx.bySrc.get(n).file);
   const list = (files) => files.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n');
   try {
@@ -2041,10 +2086,13 @@ async function renderMontage(user, ctx, plan, say) {
       const frames = pc.f1 - pc.f0;
       const dur = frames / fps;
       const src = ctx.bySrc.get(pc.src);
-      const from = clamp(pc.from, 0, Math.max(0, src.duration - 0.2));
       const z = pc.zoom || 1;
       const slow = pc.slow || 1;
+      // если куску не хватает исходника до конца файла — сдвигаем начало назад, иначе картинка замрёт
+      const need = dur / slow + 0.1;
+      const from = clamp(pc.from, 0, Math.max(0, src.duration - need));
       const vf = [
+        'setpts=PTS-STARTPTS', // первый кадр ровно в нуле: без лишнего дубля на стыке
         slow > 1 ? `setpts=${slow}*PTS` : '', // 60 fps → плавное замедление: кадры не дублируются, а растягиваются по времени
         `scale=${W}:${H}:force_original_aspect_ratio=increase`,
         z > 1 ? `scale=trunc(iw*${z}/2)*2:trunc(ih*${z}/2)*2` : '',
@@ -2055,12 +2103,12 @@ async function renderMontage(user, ctx, plan, say) {
         'format=yuv420p',
       ].filter(Boolean).join(',');
       const out = path.join(work, `v${i}.mp4`);
-      await ff(['-y', '-ss', from.toFixed(3), '-i', srcFile(pc.src), '-an', '-sn', '-dn', '-vf', vf, '-frames:v', String(frames), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-g', String(fps * 2), '-r', String(fps), '-video_track_timescale', '15360', out], 'вырезать кусок видео');
+      await ff(['-y', '-ss', from.toFixed(3), '-i', srcFile(pc.src), '-an', '-sn', '-dn', '-vf', vf, '-frames:v', String(frames), '-fps_mode', 'cfr', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-bf', '0', '-g', String(fps * 2), '-r', String(fps), '-video_track_timescale', '15360', out], 'вырезать кусок видео');
       vFiles.push(out);
     }
     await fsp.writeFile(path.join(work, 'v.txt'), list(vFiles));
     const video = path.join(work, 'video.mp4');
-    await ff(['-y', '-f', 'concat', '-safe', '0', '-i', path.join(work, 'v.txt'), '-c', 'copy', video], 'склеить видео');
+    await ff(['-y', '-fflags', '+genpts', '-f', 'concat', '-safe', '0', '-i', path.join(work, 'v.txt'), '-c', 'copy', '-avoid_negative_ts', 'make_zero', video], 'склеить видео');
 
     // 3. Субтитры, громкость, итоговый файл
     await say('🎬 Вшиваю субтитры и выравниваю громкость…');
@@ -2076,13 +2124,24 @@ async function renderMontage(user, ctx, plan, say) {
     p.version += 1;
     const out = path.join(dir, `result-${p.version}.mp4`);
     await ff(
-      ['-y', '-i', video, '-i', audio, '-map', '0:v:0', '-map', '1:a:0', ...(vf ? ['-vf', vf, '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p'] : ['-c:v', 'copy']), '-af', ctx.visual ? 'volume=0.7' : 'loudnorm=I=-14:TP=-1.5:LRA=11', '-ar', '48000', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-shortest', out],
+      ['-y', '-i', video, '-i', audio, '-map', '0:v:0', '-map', '1:a:0', ...(vf ? ['-vf', vf] : []), '-fps_mode', 'cfr', '-r', String(fps), '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p', '-g', String(fps * 2), '-video_track_timescale', '15360', '-af', ctx.visual ? 'volume=0.7' : 'loudnorm=I=-14:TP=-1.5:LRA=11', '-ar', '48000', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-shortest', out],
       'собрать итоговый ролик'
     );
-    return { v: p.version, visual: !!ctx.visual, file: path.basename(out), duration: tl.total / fps, width: W, height: H, chunks: tl.chunks.length, broll: tl.pieces.filter((x) => x.broll).length, slow: tl.pieces.filter((x) => (x.slow || 1) > 1).length, subsNote, at: new Date().toISOString() };
+    await checkSmooth(out, tl.total, fps);
+    return { v: p.version, visual: !!ctx.visual, file: path.basename(out), duration: tl.total / fps, width: W, height: H, fps, chunks: tl.chunks.length, broll: tl.pieces.filter((x) => x.broll).length, slow: tl.pieces.filter((x) => (x.slow || 1) > 1).length, subsNote, at: new Date().toISOString() };
   } finally {
     await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+/** После сборки: кадров столько, сколько в монтажном листе, и метки идут ровно — иначе в лог */
+async function checkSmooth(file, frames, fps) {
+  const r = await run(CFG.ffprobe, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=pts_time', '-of', 'csv=p=0', file], 120000).catch(() => null);
+  if (!r || r.code !== 0) return;
+  const pts = r.out.split('\n').map(parseFloat).filter((x) => isFinite(x));
+  let bad = 0;
+  for (let i = 1; i < pts.length; i++) if (Math.abs(pts[i] - pts[i - 1] - 1 / fps) > 0.004) bad++;
+  if (bad || Math.abs(pts.length - frames) > 2) log(`render check: кадров ${pts.length} (ожидалось ${frames}), неровных стыков ${bad}`);
 }
 
 /** Отправка готового ролика. Свой сервер Bot API берёт файл прямо с диска. */
@@ -2109,7 +2168,7 @@ async function sendVideoFile(chatId, file, extra = {}) {
 function resultCaption(p, extraNote) {
   const r = p.result;
   const plan = p.plan;
-  const L = [`🎬 <b>Ролик · вариант ${r.v || p.version}</b> · ${fmtDur(r.duration)}`];
+  const L = [`🎬 <b>Ролик · вариант ${r.v || p.version}</b> · ${fmtDur(r.duration)}${r.fps && r.fps !== 30 ? ` · ${r.fps} fps` : ''}`];
   if (plan.idea) L.push(esc(plan.idea));
   const facts = (r.visual ? [`планов: ${r.chunks}`, 'без речи', plan.keepSound ? 'живой звук' : 'без звука — под музыку'] : [`кусков речи: ${r.chunks}`, r.broll ? `перебивок: ${r.broll}` : '', plan.subtitles.on ? 'субтитры: да' : 'без субтитров']).concat(r.slow ? [`замедлений: ${r.slow}`] : []).filter(Boolean);
   L.push(facts.join(' · '));
@@ -2220,7 +2279,8 @@ const EDIT_HELLO = `🎬 <b>Режим монтажа.</b> Исходники п
 Можно и так: только озвучка + перебивки (видеоряд подберу под каждую фразу), только видео с речью, или речь в кадре + отдельная озвучка вместе.
 
 Пожелания к ролику пишите текстом. Потом нажмите «🎬 Смонтировать».
-Переназначить файл: /broll 3 или /talk 3. Новый ролик — /new. Учёба — /learn.`;
+Переназначить файл: /broll 3 или /talk 3. Новый ролик — /new. Учёба — /learn.
+По умолчанию ИИ не только копирует ваш стиль, но и усиливает ролик ради удержания (крючок, динамика, без воды). Отключить — /creative.`;
 
 const HOW_TO_SAVE = `По ссылке забрать ролик не получится: Instagram не отдаёт видео с музыкой из своей библиотеки.
 
@@ -2287,6 +2347,7 @@ function editStatusText(user) {
   if (p && p.result) L.push(`\n<b>Готово:</b> вариант ${p.result.v || p.version}, ${fmtDur(p.result.duration)}; правок: ${p.fixes.length}`);
   L.push('');
   L.push(user.passport ? `<b>Паспорт стиля:</b> версия ${user.passport.version}${user.passport.confirmed ? '' : ' (ещё не подтверждён)'}` : '<b>Паспорт стиля:</b> ещё не собран — /learn');
+  L.push(creativeOn(user) ? '<b>Творческая свобода ИИ:</b> включена (/creative — выключить)' : '<b>Творческая свобода ИИ:</b> выключена (/creative — включить)');
   if (p && p.spend && p.spend.calls) L.push(`<b>Ролик №${p.id}, потрачено на ИИ:</b> ≈${fmtUsd(usdOf(p.spend))} (запросов: ${p.spend.calls})`);
   L.push(costLine(user));
   return L.join('\n');
@@ -2374,6 +2435,11 @@ async function onMessage(msg) {
   if (/^\/reset\b/.test(text)) {
     return void (await send(chatId, 'Удалить все примеры, паспорт стиля и правки? Вернуть их будет нельзя.', { reply_markup: kb([[['🗑 Да, удалить всё', 'reset_yes'], ['Отмена', 'cancel']]]) }));
   }
+  if (/^\/creative\b/.test(text)) {
+    user.creative = !creativeOn(user);
+    await saveUser(user);
+    return void (await send(chatId, user.creative ? '🎨 Творческая свобода <b>включена</b>: ИИ будет усиливать ролик ради удержания — крючок в начале, смена картинки каждые пару секунд, без воды. Выключить — /creative ещё раз.' : '📐 Творческая свобода <b>выключена</b>: ИИ строго следует паспорту и вашим пожеланиям. Включить — /creative.'));
+  }
   const role = text.match(/^\/(broll|talk)(?:@\w+)?\s*(\d+)?/);
   if (role) {
     if (!user.passport) return void (await send(chatId, 'Сначала научите меня своему стилю: /learn'));
@@ -2409,7 +2475,7 @@ async function onMessage(msg) {
     await saveUser(user);
     return void (await send(chatId, `Пример ${ex.n} убран.${user.passport ? ' Чтобы паспорт это учёл, пересоберите его: /style → «Пересобрать».' : ''}`));
   }
-  if (text.startsWith('/')) return void (await send(chatId, 'Не знаю такой команды. Есть /status, /style, /edit, /learn, /new, /broll, /talk, /reset и /help.'));
+  if (text.startsWith('/')) return void (await send(chatId, 'Не знаю такой команды. Есть /status, /style, /edit, /learn, /new, /broll, /talk, /creative, /reset и /help.'));
 
   if (/instagram\.com|instagr\.am/i.test(text)) return void (await send(chatId, HOW_TO_SAVE));
 
