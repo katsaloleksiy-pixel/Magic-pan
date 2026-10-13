@@ -29,6 +29,8 @@ const CFG = {
   priceOut: Number(process.env.PRICE_OUT || 3.75),
   // прогноз: сколько входных токенов Gemini тратит на секунду видео/аудио (при MEDIA_RESOLUTION_LOW)
   tokPerSec: Number(process.env.TOK_PER_SEC || 70),
+  keepProjects: Number(process.env.KEEP_PROJECTS || 5), // сколько прошлых роликов с исходниками хранить для /history
+  tz: process.env.TZ_NAME || 'Europe/Kyiv',
   // Свой сервер Bot API (нужен для файлов больше 20 МБ)
   botApiUrl: (process.env.BOT_API_URL || '').replace(/\/+$/, ''),
   botApiBin: process.env.BOT_API_BIN || '/usr/local/bin/telegram-bot-api',
@@ -1024,17 +1026,36 @@ function fmtDur(sec) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
-const projDir = (user) => path.join(userDir(user.id), 'project');
+const projDir = (user, p = user.project) => path.join(userDir(user.id), (p && p.dir) || 'project');
 
 function newProject(user) {
   user.projSeq = (user.projSeq || 0) + 1;
-  user.project = { id: user.projSeq, seq: 0, stage: 'talk', sources: [], brief: [], fixes: [], plan: null, prevPlan: null, version: 0, result: null, prevResult: null, open: false, createdAt: new Date().toISOString() };
+  user.project = { id: user.projSeq, dir: `projects/${user.projSeq}`, seq: 0, stage: 'talk', sources: [], brief: [], fixes: [], plan: null, version: 0, result: null, history: [], final: null, open: false, createdAt: new Date().toISOString() };
   return user.project;
 }
 
+/** Все смонтированные варианты ролика (старые проекты без истории — из текущего результата) */
+function ensureHistory(p) {
+  if (!p.history) p.history = p.result ? [{ ...p.result, plan: p.plan, fixes: [...(p.fixes || [])] }] : [];
+  return p.history;
+}
+
+/** Ролик с вариантами уходит в архив вместе с исходниками — к нему можно вернуться через /history */
+async function archiveProject(user, p) {
+  p.open = false;
+  p.archivedAt = new Date().toISOString();
+  user.archive = [p, ...(user.archive || []).filter((x) => x.id !== p.id)];
+  const extra = user.archive.slice(CFG.keepProjects);
+  user.archive = user.archive.slice(0, CFG.keepProjects);
+  for (const old of extra) await fsp.rm(projDir(user, old), { recursive: true, force: true }).catch(() => {});
+}
+
 async function resetProject(user) {
-  await fsp.rm(projDir(user), { recursive: true, force: true }).catch(() => {});
+  const cur = user.project;
+  if (cur && ensureHistory(cur).length) await archiveProject(user, cur);
+  else if (cur) await fsp.rm(projDir(user, cur), { recursive: true, force: true }).catch(() => {});
   user.hold = [];
+  user.replace = null;
   user.inbox = (user.inbox || []).filter((x) => x.type !== 'source');
   return newProject(user);
 }
@@ -1348,8 +1369,6 @@ function sourceLine(src) {
     const b = ai.shots.filter((s) => s.kind === 'broll' && s.quality !== 'bad').length;
     parts.push(`${ai.shots.length} ${plural(ai.shots.length, 'план', 'плана', 'планов')}${b ? `, для перебивок: ${b}` : ''}`);
   }
-  if (src.fps >= 47) parts.push(`${Math.round(src.fps)} fps — можно замедлять`);
-  else if (src.fps && Math.round(src.fps) !== 30 && src.kind === 'video') parts.push(`${Math.round(src.fps)} fps`);
   if (role === 'broll' && !ai.shots && !src.aiError) parts.push('принят, разберу после этапа 2');
   return `${src.aiError ? '⚠️' : ai.shots || ai.phrases ? '✅' : '📥'} ${parts.join(' · ')}`;
 }
@@ -1393,6 +1412,15 @@ async function processSource(user, chatId, m) {
     if (src.kind === 'audio' && !src.hasAudio) throw new Error('не удалось прочитать звук');
     if (user.project !== p) throw new Error('пока файл загружался, вы начали новый ролик');
     p.sources.push(src);
+    if (m.replaceN) {
+      // замена: старый исходник убираем (готовые варианты в истории остаются)
+      const old = p.sources.find((x) => x.n === m.replaceN);
+      if (old) {
+        p.sources = p.sources.filter((x) => x !== old);
+        for (const f of [old.file, old.wav]) if (f) await fsp.unlink(path.join(dir, f)).catch(() => {});
+      }
+      src.replaced = m.replaceN;
+    }
     dropInbox(user, m);
     await saveUser(user);
     // Перебивки этапа 2 пока только принимаем: ИИ разберёт их, когда этап закончится
@@ -1404,7 +1432,7 @@ async function processSource(user, chatId, m) {
         await say(`⏳ Исходник ${n}: ${src.kind === 'audio' ? 'расшифровываю речь' : 'смотрю кадры'}…`);
         try {
           await analyzePatiently(user, src, say);
-          await st.done(sourceLine(src));
+          await st.done(sourceLine(src) + (src.replaced ? ` — 🔁 вместо исходника ${src.replaced}` : ''));
         } catch (e) {
           src.aiError = e.message;
           log('source ai:', e.message);
@@ -1472,13 +1500,17 @@ function stageText(user, p) {
 🎤 <b>видео, где вы говорите</b> в камеру — можно несколько файлов и дублей, лучший выберу сам;
 🎙 <b>голосовое сообщение</b> — зажмите микрофон внизу чата и наговорите текст (или пришлите аудиофайл). Под него я подберу картинку.
 
-Можно и видео, и голосовое вместе. Речи в ролике не будет — сразу жмите «Дальше».`;
+Можно и видео, и голосовое вместе. Речи в ролике не будет — сразу жмите «Дальше».
+
+⏳ Пришлите все файлы и <b>дождитесь моей сводки</b> «Исходников: …» — в ней будет кнопка «Дальше».`;
   }
   if (st === 'broll') {
     return head + `Пришлите видео, которые пойдут картинкой: продукт, процесс, место, детали, люди. Звук и речь в них я не слушаю.
 💡 Видео, снятые в 60 кадров/с, смогу плавно замедлить.
 
-Сейчас только принимаю файлы — разберу их, когда нажмёте «Дальше». Перебивок нет — тоже жмите «Дальше».`;
+Сейчас только принимаю файлы — разберу их, когда нажмёте «Дальше». Перебивок нет — тоже жмите «Дальше».
+
+⏳ Пришлите все перебивки и <b>дождитесь моей сводки</b> «Исходников: …» — в ней будет кнопка «Дальше».`;
   }
   if (st === 'brief') {
     const had = p.brief.length ? `\n\nУже записано:\n${p.brief.map((t) => `• ${esc(t)}`).join('\n')}` : '';
@@ -1527,10 +1559,17 @@ async function setStage(user, chatId, stage) {
     await saveUser(user);
     return send(chatId, '⚠️ Для монтажа нужен хотя бы один файл. Начнём с этапа 1.\n\n' + stageText(user, p), { reply_markup: stageKb(p) });
   }
-  p.stage = stage;
+  p.stage = stage; // файлы, присланные с этого момента, уже идут в новый этап
   p.summarySig = '';
-  await saveUser(user);
   if (STAGE_NO[stage] > 2) await kickDeferred(user, chatId);
+  if (isBusy(user)) {
+    // следующий шаг покажем, только когда всё присланное обработано
+    p.nextStage = stage;
+    await saveUser(user);
+    return send(chatId, `⏳ <b>Подождите, я ещё обрабатываю файлы.</b> Ничего не нажимайте — как только закончу, сам пришлю этап ${STAGE_NO[stage]}: «${STAGE_NAME[stage]}».`);
+  }
+  delete p.nextStage;
+  await saveUser(user);
   await send(chatId, stageText(user, p), { reply_markup: stageKb(p) });
 }
 
@@ -1556,6 +1595,7 @@ async function kickDeferred(user, chatId) {
           .finally(() => kicked.delete(key(s)))
       )
     );
+    setTimeout(() => afterSources(user, chatId).catch(() => {}), 50);
     await saveUser(user);
     await st.done(fail ? `⚠️ Перебивки: разобрано ${todo.length - fail} из ${todo.length}. Остальные попробую ещё раз при монтаже.` : `✅ Перебивки разобраны: ${todo.length}. ${todo.map((s) => sourceLine(s).replace(/^✅ /, '')).join('; ')}`);
   });
@@ -1593,8 +1633,16 @@ async function remarkSource(user, chatId, src, role) {
 async function afterSources(user, chatId) {
   if (isBusy(user)) return; // ещё есть файлы в очереди или идёт разбор
   const p = user.project;
-  if (!p || !p.sources.length) return;
+  if (!p) return;
   const sig = p.sources.map((s) => s.n).join(',');
+  if (p.nextStage) {
+    // пользователь уже нажал «Дальше» — вместо сводки сразу следующий этап
+    const next = p.nextStage;
+    delete p.nextStage;
+    p.summarySig = sig;
+    return setStage(user, chatId, next);
+  }
+  if (!p.sources.length) return;
   if (p.summarySig === sig) return; // этот набор уже показан
   p.summarySig = sig;
   const cnt = (r) => p.sources.filter((s) => roleOf(s) === r).length;
@@ -1727,9 +1775,15 @@ function creativeBlock(user, ctx) {
 В "notes" отдельным пунктом скажи, что сделано ради удержания.`;
 }
 
-function promptPlan(user, ctx) {
+function variantNote(p) {
+  const prev = ensureHistory(p).slice(-3).map((h) => JSON.stringify(planForAi(h.plan)));
+  return `Автор просит ДРУГОЙ вариант этого ролика. Сделай заметно иначе, чем прошлые варианты: другой крючок в начале, другой порядок или подбор фраз, другие перебивки и планы, другой темп. Пожелания автора выше сохрани.\nПрошлые варианты (не повторяй их):\n${prev.join('\n')}`;
+}
+
+function promptPlan(user, ctx, opts = {}) {
   const p = user.project;
-  const wishes = [...p.brief, ...p.fixes].map((t, i) => `${i + 1}. ${t}`).join('\n');
+  let wishes = [...p.brief, ...p.fixes].map((t, i) => `${i + 1}. ${t}`).join('\n');
+  if (opts.variant && ensureHistory(p).length) wishes += (wishes ? '\n' : '') + variantNote(p);
   if (ctx.visual) return promptVisual(user, ctx, wishes);
   return `Ты — монтажёр автора. Собери из исходников новый ролик так, как его смонтировал бы сам автор, строго по его «паспорту стиля».
 
@@ -2285,29 +2339,40 @@ async function sendVideoFile(chatId, file, extra = {}) {
 function resultCaption(p, extraNote) {
   const r = p.result;
   const plan = p.plan;
-  const L = [`🎬 <b>Ролик · вариант ${r.v || p.version}</b> · ${fmtDur(r.duration)}${r.fps && r.fps !== 30 ? ` · ${r.fps} fps` : ''}`];
+  const L = [`🎬 <b>Ролик №${p.id} · вариант ${r.v || p.version}</b> · ${fmtDur(r.duration)}${p.final === r.v ? ' · ✅ финальный' : ''}`];
+  if (r.kind === 'fix' && r.fixText) L.push(`✏️ Правка к варианту ${r.from}: «${esc(r.fixText.slice(0, 120))}»`);
+  else if (r.kind === 'variant') L.push(`🔄 Другая версия (на основе варианта ${r.from})`);
   if (plan.idea) L.push(esc(plan.idea));
   const facts = (r.visual ? [`планов: ${r.chunks}`, 'без речи', plan.keepSound ? 'живой звук' : 'без звука — под музыку'] : [`кусков речи: ${r.chunks}`, r.broll ? `перебивок: ${r.broll}` : '', plan.subtitles.on ? 'субтитры: да' : 'без субтитров']).concat(r.slow ? [`замедлений: ${r.slow}`] : []).filter(Boolean);
   L.push(facts.join(' · '));
   if (r.cost) L.push(`💰 Этот вариант: ≈${fmtUsd(r.cost.usd)} (запросов ИИ: ${r.cost.calls}) · всего по ролику: ≈${fmtUsd(usdOf(spendOf(p)))}`);
   for (const n of plan.notes.slice(0, 4)) L.push(`• ${esc(n)}`);
   if (extraNote) L.push(`⚠️ ${esc(extraNote)}`);
-  L.push('\nПравки пишите сообщением: «убери вторую фразу», «субтитры крупнее и жёлтые», «больше перебивок».');
+  L.push('\nПравку можно написать сразу сообщением: «убери вторую фразу», «субтитры крупнее».');
   let c = L.join('\n');
   if (c.length > 1000) c = c.slice(0, 990) + '…';
   return c;
 }
 
-const resultKb = (p) => kb([[...(p.prevResult ? [['↩️ Прошлый вариант', 'm_undo']] : []), ['🆕 Новый ролик', 'm_new']]]);
+/** Кнопки под готовым роликом. В кнопках номер варианта — они работают и под старыми сообщениями. */
+const resultKb = (p) => {
+  const v = p.result ? p.result.v : 0;
+  return kb([
+    [['✏️ Правка', `r_fix:${v}`], ['🔄 Другой вариант', `r_alt:${v}`]],
+    [['✅ Всё подходит', `r_ok:${v}`], ['🧬 Уникализировать', `r_uniq:${v}`]],
+    [['🔁 Заменить исходник', 'r_swap'], ...(prevVariant(p) ? [['↩️ Прошлый вариант', 'm_undo']] : [])],
+    [['🗂 История', 'r_hist'], ['🆕 Новый ролик', 'm_new']],
+  ]);
+};
 
 /** Монтаж с нуля (fixText пустой) или правка уже готового ролика */
-async function makeMontage(user, chatId, fixText) {
+async function makeMontage(user, chatId, fixText, opts = {}) {
   const p = user.project;
   if (!user.passport) return void (await send(chatId, 'Сначала научите меня своему стилю: /learn'));
   if (!p || !p.sources.length) return void (await send(chatId, 'Пришлите исходники ролика: видео, перебивки, озвучку.'));
   if (fixText && !p.plan) fixText = '';
   const spent0 = snapSpend(p);
-  const st = await progress(user, chatId, fixText ? '✏️ Вношу правку…' : '🎬 Начинаю монтаж…');
+  const st = await progress(user, chatId, fixText ? '✏️ Вношу правку…' : opts.variant ? '🔄 Делаю другой вариант…' : '🎬 Начинаю монтаж…');
   const say = (t) => st.set(t);
   try {
     const bg = [...(bgJobs.get(user.id) || [])];
@@ -2334,22 +2399,26 @@ async function makeMontage(user, chatId, fixText) {
     }
     await say(fixText ? '✏️ Меняю план монтажа…' : ctx.visual ? '🧠 Подбираю планы и темп…' : '🧠 Выбираю лучшие дубли и подбираю перебивки…');
     const planSnap = snapSpend(p);
-    const raw = await geminiJson(user, [{ text: fixText ? promptFix(user, ctx, fixText) : promptPlan(user, ctx) }], { long: true, onWait: (t) => say(`🧠 ${t}…`) });
+    const raw = await geminiJson(user, [{ text: fixText ? promptFix(user, ctx, fixText) : promptPlan(user, ctx, opts) }], { long: true, onWait: (t) => say(`🧠 ${t}…`) });
     const pt = spendDelta(planSnap, spendOf(p));
     p.lastPlanTok = { in: pt.in, out: pt.out }; // запомним для прогноза следующего монтажа
     const plan = normalizePlan(raw, ctx);
     const res = await renderMontage(user, ctx, plan, say);
     const runSpend = spendDelta(spent0, spendOf(p));
     res.cost = { in: runSpend.in, out: runSpend.out, calls: runSpend.calls, usd: usdOf(runSpend) };
-    // старый прошлый вариант больше не нужен
-    if (p.prevResult && p.prevResult.file !== res.file) await fsp.unlink(path.join(projDir(user), p.prevResult.file)).catch(() => {});
-    p.prevResult = p.result;
-    p.prevPlan = p.plan;
+    // каждый вариант остаётся в истории ролика
+    ensureHistory(p);
+    if (fixText) p.fixes.push(fixText);
+    res.fixes = [...p.fixes];
+    res.plan = plan;
+    res.kind = fixText ? 'fix' : opts.variant ? 'variant' : 'new';
+    res.from = p.result ? p.result.v : null;
+    if (fixText) res.fixText = fixText;
+    p.history.push(res);
     p.result = res;
     p.plan = plan;
     p.open = false;
-    if (fixText) p.fixes.push(fixText);
-    res.fixes = [...p.fixes];
+    p.stage = 'ready';
     await saveUser(user);
     await say('📤 Отправляю ролик…');
     await sendVideoFile(chatId, path.join(projDir(user), res.file), { caption: resultCaption(p, res.subsNote), width: res.width, height: res.height, duration: Math.round(res.duration), reply_markup: resultKb(p) });
@@ -2362,14 +2431,40 @@ async function makeMontage(user, chatId, fixText) {
   }
 }
 
+/** Вариант, из которого сделан текущий (для «↩️ Прошлый вариант») */
+function prevVariant(p) {
+  const h = ensureHistory(p);
+  if (!p.result) return null;
+  return h.find((x) => x.v === p.result.from) || h[h.findIndex((x) => x.v === p.result.v) - 1] || null;
+}
+
+/** Сделать вариант текущим (правки пойдут от него) */
+function useVariant(user, v) {
+  const p = user.project;
+  const it = p && ensureHistory(p).find((x) => x.v === Number(v));
+  if (!it) return null;
+  if (!p.result || p.result.v !== it.v) {
+    p.result = it;
+    p.plan = it.plan;
+    p.fixes = [...(it.fixes || [])];
+  }
+  return it;
+}
+
+async function showVariant(user, chatId, it, note = '') {
+  const p = user.project;
+  const file = path.join(projDir(user), it.file);
+  if (!fs.existsSync(file)) return send(chatId, `Файл варианта ${it.v} не сохранился. Можно сделать новый: «🔄 Другой вариант».`);
+  return sendVideoFile(chatId, file, { caption: resultCaption(p, note), width: it.width, height: it.height, duration: Math.round(it.duration), reply_markup: resultKb(p) });
+}
+
 async function undoMontage(user, chatId) {
   const p = user.project;
-  if (!p || !p.prevResult) return void (await send(chatId, 'Прошлого варианта уже нет.'));
-  [p.result, p.prevResult] = [p.prevResult, p.result];
-  [p.plan, p.prevPlan] = [p.prevPlan, p.plan];
-  p.fixes = [...(p.result.fixes || [])];
+  const prev = p && prevVariant(p);
+  if (!prev) return void (await send(chatId, 'Прошлого варианта нет.'));
+  useVariant(user, prev.v);
   await saveUser(user);
-  await sendVideoFile(chatId, path.join(projDir(user), p.result.file), { caption: resultCaption(p, ''), width: p.result.width, height: p.result.height, duration: Math.round(p.result.duration), reply_markup: resultKb(p) });
+  await showVariant(user, chatId, prev);
 }
 
 // ───────────────────────────── Тексты ─────────────────────────────
@@ -2387,7 +2482,7 @@ const HELLO = `Привет! Я Магическая кастрюля — мон
 3. Пожелания к ролику — или «на выбор ИИ».
 4. Монтаж: покажу цену, смонтирую, правки — сообщением.
 
-Команды: /status — что загружено, /style — паспорт, /new — новый ролик, /reset — удалить всё.`;
+Команды: /status — что загружено, /style — паспорт, /new — новый ролик, /history — готовые ролики, /reset — удалить всё.`;
 
 
 
@@ -2547,6 +2642,7 @@ async function onMessage(msg) {
   if (/^\/reset\b/.test(text)) {
     return void (await send(chatId, 'Удалить все примеры, паспорт стиля и правки? Вернуть их будет нельзя.', { reply_markup: kb([[['🗑 Да, удалить всё', 'reset_yes'], ['Отмена', 'cancel']]]) }));
   }
+  if (/^\/history\b/.test(text)) return void (await showHistory(user, chatId));
   if (/^\/creative\b/.test(text)) {
     user.creative = !creativeOn(user);
     await saveUser(user);
@@ -2587,7 +2683,7 @@ async function onMessage(msg) {
     await saveUser(user);
     return void (await send(chatId, `Пример ${ex.n} убран.${user.passport ? ' Чтобы паспорт это учёл, пересоберите его: /style → «Пересобрать».' : ''}`));
   }
-  if (text.startsWith('/')) return void (await send(chatId, 'Не знаю такой команды. Есть /status, /style, /edit, /learn, /new, /broll, /talk, /creative, /reset и /help.'));
+  if (text.startsWith('/')) return void (await send(chatId, 'Не знаю такой команды. Есть /status, /style, /edit, /learn, /new, /history, /broll, /talk, /creative, /reset и /help.'));
 
   if (/instagram\.com|instagr\.am/i.test(text)) return void (await send(chatId, HOW_TO_SAVE));
 
@@ -2634,6 +2730,13 @@ const busy = (user) => isBusy(user);
 async function onSourceMedia(user, chatId, m) {
   if (!user.project) newProject(user);
   const p = user.project;
+  if (user.replace && user.replace.pid === p.id && !m.replaceN) {
+    const old = p.sources.find((x) => x.n === user.replace.n);
+    m.replaceN = user.replace.n;
+    m.role = m.kind === 'audio' ? 'voice' : old && roleOf(old) !== 'voice' ? roleOf(old) : 'talk';
+    user.replace = null;
+    p.open = true;
+  }
   if (!m.role) m.role = m.kind === 'audio' ? 'voice' : stageOf(p) === 'talk' ? 'talk' : 'broll';
   // К готовому ролику прислали ещё файлы — спрашиваем, к какому ролику они
   if (p.result && !p.open) {
@@ -2667,6 +2770,216 @@ function queueExample(user, chatId, m) {
   });
 }
 
+// ───────────────────────────── После монтажа: история, уникализация, замена ─────────────────────────────
+
+function fmtWhen(iso) {
+  try {
+    return new Intl.DateTimeFormat('ru-RU', { timeZone: CFG.tz, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
+  } catch (_) {
+    return String(iso || '').slice(5, 16).replace('T', ' ');
+  }
+}
+
+const allProjects = (user) => [user.project, ...(user.archive || [])].filter((p) => p && ensureHistory(p).length);
+
+async function showHistory(user, chatId) {
+  const list = allProjects(user);
+  if (!list.length) return send(chatId, '🗂 История пуста: пока нет смонтированных роликов.');
+  const L = ['🗂 <b>История роликов</b>\n'];
+  for (const p of list) {
+    const h = ensureHistory(p);
+    const idea = (h[h.length - 1].plan && h[h.length - 1].plan.idea) || '';
+    L.push(`${p === user.project ? '▶️ ' : ''}<b>Ролик №${p.id}</b> · ${fmtWhen(p.createdAt)} · вариантов: ${h.length}${p.final ? ` · ✅ финальный: ${p.final}` : ''}${idea ? `\n${esc(idea.slice(0, 80))}` : ''}`);
+  }
+  L.push(`\nОткройте ролик, чтобы посмотреть варианты и продолжить правки. Храню последние ${CFG.keepProjects} роликов вместе с исходниками.`);
+  const btns = list.map((p) => [`📂 №${p.id}`, `h_p:${p.id}`]);
+  const rows = [];
+  for (let i = 0; i < btns.length; i += 3) rows.push(btns.slice(i, i + 3));
+  return send(chatId, L.join('\n'), { reply_markup: kb(rows) });
+}
+
+async function showVariants(user, chatId) {
+  const p = user.project;
+  const h = ensureHistory(p);
+  if (!h.length) return send(chatId, `В ролике №${p.id} пока нет готовых вариантов.`);
+  const kind = (x) => (x.kind === 'fix' ? `правка к ${x.from}` : x.kind === 'variant' ? 'другая версия' : 'монтаж');
+  const L = [`📂 <b>Ролик №${p.id}</b> — варианты:\n`];
+  for (const x of h) {
+    L.push(`<b>${x.v}.</b> ${fmtDur(x.duration)} · ${kind(x)}${x.cost ? ` · ${fmtUsd(x.cost.usd)}` : ''}${p.final === x.v ? ' · ✅ финальный' : ''}${p.result && p.result.v === x.v ? ' · текущий' : ''}${x.fixText ? `\n    «${esc(x.fixText.slice(0, 70))}»` : ''}`);
+  }
+  L.push('\nВыберите вариант — пришлю его, и правки пойдут от него.');
+  const btns = h.map((x) => [`▶️ ${x.v}`, `h_v:${x.v}`]);
+  const rows = [];
+  for (let i = 0; i < btns.length; i += 4) rows.push(btns.slice(i, i + 4));
+  rows.push([['🗂 Все ролики', 'r_hist']]);
+  return send(chatId, L.join('\n'), { reply_markup: kb(rows) });
+}
+
+/** Открыть ролик из архива: текущий уходит в архив, выбранный становится текущим */
+async function openProject(user, id) {
+  if (user.project && user.project.id === id) return user.project;
+  const p = (user.archive || []).find((x) => x.id === id);
+  if (!p) return null;
+  user.archive = user.archive.filter((x) => x !== p);
+  const cur = user.project;
+  if (cur && ensureHistory(cur).length) await archiveProject(user, cur);
+  else if (cur) await fsp.rm(projDir(user, cur), { recursive: true, force: true }).catch(() => {});
+  delete p.archivedAt;
+  p.open = false;
+  p.stage = 'ready';
+  user.project = p;
+  user.mode = 'edit';
+  return p;
+}
+
+async function swapMenu(user, chatId) {
+  const p = user.project;
+  if (!p || !p.sources.length) return send(chatId, 'В этом ролике нет исходников.');
+  const L = ['🔁 <b>Какой исходник заменить?</b>\n'];
+  for (const s of p.sources) L.push(sourceLine(s).replace(/^\S+ /, ''));
+  L.push('\nПосле замены нажмите «▶️ Смонтировать» — получится новый вариант. Прежние варианты останутся в истории.');
+  const btns = p.sources.map((s) => [`${ROLE_ICON[roleOf(s)]} ${s.n}`, `sw:${s.n}`]);
+  const rows = [];
+  for (let i = 0; i < btns.length; i += 4) rows.push(btns.slice(i, i + 4));
+  rows.push([['➕ Добавить речь', 'add:talk'], ['➕ Добавить перебивки', 'add:broll']]);
+  return send(chatId, L.join('\n'), { reply_markup: kb(rows) });
+}
+
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = (a, b) => (Math.random() < 0.5 ? rnd(-b, -a) : rnd(a, b)); // не ближе a к нулю
+
+/**
+ * Уникализация: копии готового ролика с небольшими изменениями картинки, звука, длины и метаданных.
+ * Без ИИ — только ffmpeg, поэтому бесплатно.
+ */
+async function uniqueize(user, chatId, it, n) {
+  const p = user.project;
+  const dir = projDir(user);
+  const srcFile = path.join(dir, it.file);
+  if (!fs.existsSync(srcFile)) return send(chatId, 'Файл этого варианта не сохранился.');
+  const W = it.width || 1080;
+  const H = it.height || 1920;
+  const fps = it.fps || CFG.fps;
+  const st = await progress(user, chatId, `🧬 Делаю копии варианта ${it.v}: 0 из ${n}…`);
+  try {
+    for (let i = 1; i <= n; i++) {
+      await st.set(`🧬 Делаю копии варианта ${it.v}: ${i} из ${n}…`);
+      const z = rnd(1.04, 1.08);
+      const ang = pick(0.15, 0.5);
+      const sp = 1 + pick(0.01, 0.03);
+      const trim = rnd(0.05, 0.3);
+      const br = pick(0.01, 0.04);
+      const ct = 1 + pick(0.01, 0.04);
+      const sat = 1 + pick(0.02, 0.08);
+      const ox = Math.round(rnd(-6, 6));
+      const oy = Math.round(rnd(-10, 10));
+      const crf = Math.round(rnd(18, 23));
+      const vf = [
+        `scale=trunc(${W}*${z.toFixed(4)}/2)*2:trunc(${H}*${z.toFixed(4)}/2)*2`,
+        `rotate=${ang.toFixed(3)}*PI/180:ow=iw:oh=ih:c=black`,
+        `crop=${W}:${H}:(iw-${W})/2+${ox}:(ih-${H})/2+${oy}`,
+        `eq=brightness=${br.toFixed(3)}:contrast=${ct.toFixed(3)}:saturation=${sat.toFixed(3)}`,
+        `noise=alls=${Math.round(rnd(1, 4))}:allf=t`,
+        `setpts=PTS/${sp.toFixed(4)}`,
+        `fps=${fps}`,
+        'format=yuv420p',
+      ].join(',');
+      const out = path.join(dir, `uniq-${it.v}-${i}.mp4`);
+      await ff(
+        ['-y', '-ss', trim.toFixed(3), '-i', srcFile, '-vf', vf, '-af', `atempo=${sp.toFixed(4)},volume=${pick(0.3, 1).toFixed(2)}dB`, '-map_metadata', '-1', '-metadata', `title=${Date.now().toString(36)}${i}`, '-metadata', `creation_time=${new Date().toISOString()}`, '-c:v', 'libx264', '-preset', 'medium', '-crf', String(crf), '-g', String(Math.round(rnd(1.5, 3) * fps)), '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', `${[160, 192, 224][i % 3]}k`, '-movflags', '+faststart', out],
+        'сделать копию'
+      );
+      const caption = `🧬 <b>Копия ${i} из ${n}</b> · ролик №${p.id}, вариант ${it.v}\nмасштаб ${num(z * 100)}%, поворот ${num(ang)}°, скорость ${num(sp, 2)}×, начало −${num(trim, 2)} с, сдвинуты яркость/контраст/цвет, другое сжатие и метаданные`;
+      try {
+        await sendVideoFile(chatId, out, { caption, width: W, height: H });
+      } finally {
+        await fsp.unlink(out).catch(() => {});
+      }
+    }
+    await st.done(`🧬 Готово: ${n} ${plural(n, 'копия', 'копии', 'копий')} варианта ${it.v}.`);
+  } catch (e) {
+    await st.done(`⚠️ Уникализация прервалась: ${esc(e.message)}.`);
+  }
+}
+
+/** Кнопки вида «действие:параметр» (под роликом, в истории, в замене) */
+async function onCallbackArg(user, chatId, q, done, dropButtons) {
+  const [cmd, a, b] = q.data.split(':');
+  const p = user.project;
+  const needIdle = ['r_alt', 'r_uniq', 'u_n', 'h_p', 'h_v', 'sw', 'add'];
+  if (needIdle.includes(cmd) && busy(user)) return done('Подождите, я ещё занят');
+  switch (cmd) {
+    case 'r_fix': {
+      const it = useVariant(user, a);
+      if (!it) return done('Этого варианта уже нет');
+      await done();
+      await saveUser(user);
+      return send(chatId, `✏️ Напишите одним сообщением, что поправить в варианте ${it.v}. Например:\n• «убери вторую фразу»\n• «субтитры крупнее и жёлтые»\n• «больше перебивок, начни с кадра с рыбой»`);
+    }
+    case 'r_alt': {
+      if (!useVariant(user, a)) return done('Этого варианта уже нет');
+      await done('Делаю другой вариант…');
+      await saveUser(user);
+      return enqueue(user, chatId, () => makeMontage(user, chatId, '', { variant: true }));
+    }
+    case 'r_ok': {
+      const it = useVariant(user, a);
+      if (!it) return done('Этого варианта уже нет');
+      p.final = it.v;
+      await saveUser(user);
+      await done('Отмечено');
+      return send(chatId, `✅ <b>Вариант ${it.v} ролика №${p.id} — финальный.</b> Он сохранён в истории (/history).\n\nМожно сделать уникальные копии для повторных публикаций или начать новый ролик.`, { reply_markup: kb([[['🧬 Уникализировать', `r_uniq:${it.v}`]], [['🆕 Новый ролик', 'm_new'], ['🗂 История', 'r_hist']]]) });
+    }
+    case 'r_uniq': {
+      const it = useVariant(user, a);
+      if (!it) return done('Этого варианта уже нет');
+      await done();
+      return send(chatId, `🧬 <b>Уникализация варианта ${it.v}</b>\n\nСделаю копии, у которых чуть-чуть отличаются кадрирование, наклон, скорость, цвет, длина, сжатие и метаданные — на глаз ролик тот же. ИИ не нужен, это бесплатно.\n\n⚠️ Гарантировать, что Instagram посчитает копии новыми, нельзя: его алгоритмы закрыты. И массовые повторы одного ролика могут нарушать правила Instagram.\n\nСколько копий сделать?`, { reply_markup: kb([[['3', `u_n:${it.v}:3`], ['5', `u_n:${it.v}:5`], ['10', `u_n:${it.v}:10`]]]) });
+    }
+    case 'u_n': {
+      const it = useVariant(user, a);
+      const n = clamp(Number(b) || 3, 1, 10);
+      if (!it) return done('Этого варианта уже нет');
+      await done(`Делаю ${n}…`);
+      await dropButtons();
+      return enqueue(user, chatId, () => uniqueize(user, chatId, it, n));
+    }
+    case 'h_p': {
+      const np = await openProject(user, Number(a));
+      if (!np) return done('Этого ролика уже нет в истории');
+      await done();
+      await saveUser(user);
+      return showVariants(user, chatId);
+    }
+    case 'h_v': {
+      const it = useVariant(user, a);
+      if (!it) return done('Этого варианта уже нет');
+      await done();
+      p.stage = 'ready';
+      p.open = false;
+      await saveUser(user);
+      return showVariant(user, chatId, it);
+    }
+    case 'sw': {
+      const src = p && p.sources.find((x) => x.n === Number(a));
+      if (!src) return done('Этого исходника уже нет');
+      user.replace = { pid: p.id, n: src.n };
+      p.stage = 'ready';
+      await saveUser(user);
+      await done();
+      const what = { talk: 'видео, где вы говорите (или голосовое)', broll: 'видео для перебивки', voice: 'голосовое или аудиофайл (или видео с речью)' }[roleOf(src)];
+      return send(chatId, `🔁 Пришлите новый файл вместо исходника ${src.n} (${ROLE_NAME[roleOf(src)]}): ${what}.\n\n⏳ Дождитесь, пока я его обработаю, — потом пришлю кнопку «▶️ Смонтировать».`);
+    }
+    case 'add': {
+      if (!p) return done();
+      await done();
+      p.open = true;
+      return setStage(user, chatId, a === 'broll' ? 'broll' : 'talk');
+    }
+  }
+  return done();
+}
+
 async function onCallback(q) {
   const msg = q.message;
   const done = (text) => tg('answerCallbackQuery', { callback_query_id: q.id, ...(text ? { text } : {}) }).catch(() => {});
@@ -2677,7 +2990,16 @@ async function onCallback(q) {
   const user = await getUser(id, q.from.first_name);
   const dropButtons = () => tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {});
 
+  if (q.data.includes(':')) return onCallbackArg(user, chatId, q, done, dropButtons);
   switch (q.data) {
+    case 'r_hist':
+      await done();
+      await showHistory(user, chatId);
+      break;
+    case 'r_swap':
+      await done();
+      await swapMenu(user, chatId);
+      break;
     case 'build':
       await done('Собираю…');
       await dropButtons();
@@ -2867,7 +3189,11 @@ async function recover() {
     const p = user.project;
     const unfinished = p ? p.sources.filter((s) => needsAnalysis(user, s) && !(roleOf(s) === 'broll' && stageOf(p) === 'broll')) : [];
     await saveUser(user);
-    if (!inbox.length && !unfinished.length && !wasMontage) continue;
+    if (!inbox.length && !unfinished.length && !wasMontage) {
+      // ждал следующего этапа, а обрабатывать уже нечего — показываем этап
+      if (p && p.nextStage) await afterSources(user, chatId).catch(() => {});
+      continue;
+    }
     const parts = ['♻️ Бот перезапускался.'];
     if (inbox.length) parts.push(`Продолжаю приём файлов: ${inbox.length}.`);
     if (unfinished.length) parts.push(`Доразбираю исходники: ${unfinished.length}.`);
