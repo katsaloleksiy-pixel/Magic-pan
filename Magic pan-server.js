@@ -21,6 +21,8 @@ const CFG = {
   token: (process.env.BOT_TOKEN || '').trim(),
   geminiKey: (process.env.GEMINI_API_KEY || '').trim(),
   geminiModel: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+  // Запасная модель — когда основная перегружена. Пустое значение отключает
+  geminiFallback: process.env.GEMINI_FALLBACK_MODEL != null ? process.env.GEMINI_FALLBACK_MODEL.trim() : 'gemini-3.1-flash-lite',
   geminiUrl: (process.env.GEMINI_API_URL || 'https://generativelanguage.googleapis.com').replace(/\/+$/, ''),
   // Цена за 1 млн токенов, только для подсказки о расходах в /status
   priceIn: Number(process.env.PRICE_IN || 0.75),
@@ -46,6 +48,9 @@ const CFG = {
   fontsDir: process.env.FONTS_DIR || path.join(__dirname, 'fonts'),
   subFont: process.env.SUB_FONT || 'Montserrat ExtraBold',
   pauseMax: Number(process.env.PAUSE_MAX || 0.4), // паузы в речи длиннее этого вырезаются
+  aiParallel: Number(process.env.AI_PARALLEL || 3), // сколько исходников разбирать одновременно
+  batchMax: Number(process.env.AI_BATCH || 8), // сколько коротких видео разбирать одним запросом
+  batchMaxSec: Number(process.env.AI_BATCH_SEC || 90), // «короткое» видео — до стольких секунд
 };
 
 const CLOUD_API = 'https://api.telegram.org';
@@ -153,7 +158,7 @@ const userDir = (id) => path.join(CFG.dataDir, 'users', String(id));
 
 async function writeJson(file, data) {
   await fsp.mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp`;
+  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   await fsp.writeFile(tmp, JSON.stringify(data, null, 1));
   await fsp.rename(tmp, file);
 }
@@ -209,7 +214,7 @@ function send(chatId, html, extra = {}) {
 }
 
 function edit(chatId, messageId, html, extra = {}) {
-  return tg('editMessageText', { chat_id: chatId, message_id: messageId, text: html, parse_mode: 'HTML', ...extra }).catch((e) => {
+  return tg('editMessageText', { chat_id: chatId, message_id: messageId, text: html, parse_mode: 'HTML', link_preview_options: { is_disabled: true }, ...extra }).catch((e) => {
     if (!/not modified/i.test(e.message)) log('edit:', e.message);
   });
 }
@@ -351,7 +356,20 @@ async function gfetch(url, opts, timeoutMs) {
   }
 }
 
+/** Загрузка файла в Gemini с повтором при обрыве связи или перегрузке */
 async function geminiUpload(file, waitMs = 5 * 60 * 1000) {
+  for (let i = 1; ; i++) {
+    try {
+      return await geminiUploadOnce(file, waitMs);
+    } catch (e) {
+      if (i >= 3 || !/нет связи|HTTP 5\d\d|HTTP 429/.test(e.message)) throw e;
+      log('upload retry:', e.message);
+      await sleep(5000 * i);
+    }
+  }
+}
+
+async function geminiUploadOnce(file, waitMs) {
   const ext = path.extname(file).toLowerCase();
   const mime = MIME[ext] || AUDIO_MIME[ext] || 'video/mp4';
   const size = (await fsp.stat(file)).size;
@@ -399,36 +417,125 @@ function geminiDelete(name) {
 }
 
 /** Запрос к модели. Возвращает разобранный JSON. */
+// ── Лимиты Gemini ──
+const exhausted = new Map(); // модель → когда снова доступна (дневной лимит)
+
+function nextQuotaReset() {
+  // дневные лимиты Google сбрасываются в полночь по тихоокеанскому времени — берём с запасом +1 ч
+  const now = new Date();
+  const la = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+  const midnight = new Date(la);
+  midnight.setHours(24, 0, 0, 0);
+  return now.getTime() + (midnight - la) + 3600e3;
+}
+
+/** Первая доступная модель: основная, потом запасная. except — исключить текущую */
+function pickModel(except) {
+  for (const m of [CFG.geminiModel, CFG.geminiFallback]) {
+    if (!m || m === except) continue;
+    const until = exhausted.get(m);
+    if (until && until > Date.now()) continue;
+    return m;
+  }
+  return null;
+}
+
+function quotaInfo(err) {
+  const det = Array.isArray(err.details) ? err.details : [];
+  const ids = det.flatMap((d) => (d.violations || []).map((v) => `${v.quotaId || ''} ${v.quotaMetric || ''}`)).join(' ') + ' ' + (err.message || '');
+  const retry = det.find((d) => d.retryDelay);
+  return { daily: /PerDay/i.test(ids), free: /free_?tier/i.test(ids), retrySec: retry ? parseFloat(retry.retryDelay) : null };
+}
+
+function quotaError(perMinute) {
+  const e = new Error(
+    perMinute
+      ? 'Google ограничивает число запросов в минуту на бесплатном тарифе Gemini — подождите пару минут или подключите оплату в Google AI Studio'
+      : 'на сегодня закончился бесплатный лимит запросов к Gemini. Подключите оплату в Google AI Studio (aistudio.google.com → Billing) — лимиты станут намного выше — или подождите до завтра'
+  );
+  e.quota = true;
+  return e;
+}
+
 async function geminiJson(user, parts, opts = {}) {
-  const url = `${CFG.geminiUrl}/v1beta/models/${CFG.geminiModel}:generateContent`;
   const base = { contents: [{ role: 'user', parts }] };
   // Сначала просим строгий JSON (и, если нужно, длинный ответ и экономный разбор видео);
   // если сервис не знает какой-то настройки — повторяем без неё
-  const json = { responseMimeType: 'application/json' };
-  const full = { ...json };
-  if (opts.long) full.maxOutputTokens = 65536;
-  if (opts.lowRes) full.mediaResolution = 'MEDIA_RESOLUTION_LOW';
-  let variants = [{ ...base, generationConfig: full }];
-  if (opts.lowRes) variants.push({ ...base, generationConfig: { ...full, mediaResolution: undefined } });
-  if (opts.long || opts.lowRes) variants.push({ ...base, generationConfig: json });
+  // Необязательные настройки снимаем по одной, если сервис их не принимает
+  const extras = [];
+  if (opts.fast) extras.push(['thinkingConfig', { thinkingLevel: 'low' }]);
+  if (opts.lowRes) extras.push(['mediaResolution', 'MEDIA_RESOLUTION_LOW']);
+  if (opts.long) extras.push(['maxOutputTokens', 65536]);
+  let variants = [];
+  for (let i = 0; i <= extras.length; i++) {
+    variants.push({ ...base, generationConfig: Object.assign({ responseMimeType: 'application/json' }, Object.fromEntries(extras.slice(i))) });
+  }
   variants.push(base);
   let lastErr;
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const res = await gfetch(
-      url,
-      { method: 'POST', headers: { 'x-goog-api-key': CFG.geminiKey, 'content-type': 'application/json' }, body: JSON.stringify(variants[0]) },
-      10 * 60 * 1000
-    );
+  // Перегрузку и лимит «в минуту» пережидаем; дневной лимит — сразу переходим на запасную модель
+  let model = pickModel();
+  if (!model) throw quotaError();
+  let overloads = 0;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    let res;
+    try {
+      res = await gfetch(
+        `${CFG.geminiUrl}/v1beta/models/${model}:generateContent`,
+        { method: 'POST', headers: { 'x-goog-api-key': CFG.geminiKey, 'content-type': 'application/json' }, body: JSON.stringify(variants[0]) },
+        10 * 60 * 1000
+      );
+    } catch (e) {
+      // обрыв связи — повторяем, как при перегрузке
+      overloads++;
+      lastErr = e;
+      lastErr.overload = true;
+      if (overloads > 5) break;
+      await sleep(5000 * overloads);
+      continue;
+    }
     const j = await res.json().catch(() => null);
     if (!res.ok) {
-      const msg = (j && j.error && j.error.message) || `HTTP ${res.status}`;
-      lastErr = new Error(`ИИ-сервис ответил ошибкой: ${msg.slice(0, 300)}`);
+      const err = (j && j.error) || {};
+      const msg = err.message || `HTTP ${res.status}`;
+      lastErr = new Error(`ИИ-сервис ответил ошибкой: ${msg.slice(0, 200)}`);
       if (res.status === 400 && variants.length > 1) {
         variants = variants.slice(1);
         continue;
       }
+      if (res.status === 429 && /quota/i.test(msg)) {
+        const q = quotaInfo(err);
+        if (q.daily) {
+          exhausted.set(model, nextQuotaReset());
+          log(`Gemini ${model}: дневной лимит исчерпан`);
+          model = pickModel();
+          if (!model) throw quotaError();
+          if (opts.onWait) await opts.onWait('дневной лимит основной модели исчерпан — перехожу на запасную');
+          continue;
+        }
+        overloads++;
+        if (overloads > 6) {
+          lastErr = quotaError(true);
+          break;
+        }
+        const wait = clamp(q.retrySec || 30, 5, 65);
+        if (opts.onWait) await opts.onWait(`лимит запросов в минуту — жду ${wait} с`);
+        await sleep(wait * 1000);
+        continue;
+      }
       if (res.status === 429 || res.status >= 500) {
-        await sleep(3000 * (attempt + 1));
+        overloads++;
+        lastErr = new Error('серверы Google сейчас перегружены');
+        lastErr.overload = true;
+        if (overloads === 3 && CFG.geminiFallback && CFG.geminiFallback !== model && pickModel(model)) {
+          log(`Gemini ${model} перегружен, перехожу на ${CFG.geminiFallback}`);
+          model = CFG.geminiFallback;
+          if (opts.onWait) await opts.onWait('ИИ перегружен — переключаюсь на запасную модель');
+          continue;
+        }
+        if (overloads > 6) break;
+        const wait = Math.min(30, 5 * 2 ** Math.min(overloads - 1, 3));
+        if (opts.onWait) await opts.onWait(`ИИ перегружен — жду ${wait} с и пробую снова`);
+        await sleep(wait * 1000);
         continue;
       }
       throw lastErr;
@@ -630,12 +737,24 @@ function renderPassport(user) {
 // ───────────────────────────── Очередь задач ─────────────────────────────
 
 let chain = Promise.resolve();
-const pending = new Map(); // сколько задач ждёт у пользователя
+const pending = new Map(); // сколько задач у пользователя: в работе + ждут
+const waiting = new Map(); // сколько задач ещё не начаты
+const bgJobs = new Map(); // разборы ИИ, которые идут параллельно очереди: user.id → Set<Promise>
+
+const bgCount = (user) => (bgJobs.get(user.id) || new Set()).size;
+const isBusy = (user) => (pending.get(user.id) || 0) > 0 || bgCount(user) > 0;
 
 function enqueue(user, chatId, job) {
   pending.set(user.id, (pending.get(user.id) || 0) + 1);
+  waiting.set(user.id, (waiting.get(user.id) || 0) + 1);
+  activity(user, chatId);
+  queueNote(user, chatId);
   chain = chain
-    .then(job)
+    .then(() => {
+      waiting.set(user.id, Math.max(0, (waiting.get(user.id) || 1) - 1));
+      queueNote(user, chatId);
+      return job();
+    })
     .catch((e) => {
       log('job:', e.stack || e.message);
       return send(chatId, `⚠️ Не получилось: ${esc(e.message)}`).catch(() => {});
@@ -646,6 +765,90 @@ function enqueue(user, chatId, job) {
       await saveUser(user).catch((e) => log('save:', e.message));
     });
   return chain;
+}
+
+/** Фоновая задача (разбор ИИ) — не держит очередь, но учитывается как «занят» */
+function background(user, chatId, job) {
+  if (!bgJobs.has(user.id)) bgJobs.set(user.id, new Set());
+  const set = bgJobs.get(user.id);
+  const pr = Promise.resolve()
+    .then(job)
+    .catch((e) => log('bg:', e.stack || e.message))
+    .finally(() => {
+      set.delete(pr);
+      saveUser(user).catch(() => {});
+    });
+  set.add(pr);
+  activity(user, chatId);
+  return pr;
+}
+
+/** Пока бот работает, в шапке чата висит «печатает…» */
+const actTimers = new Map();
+function activity(user, chatId) {
+  if (actTimers.has(user.id)) return;
+  const ping = () => tg('sendChatAction', { chat_id: chatId, action: 'typing' }, 10000).catch(() => {});
+  ping();
+  const iv = setInterval(() => {
+    if (!isBusy(user)) {
+      clearInterval(iv);
+      actTimers.delete(user.id);
+      return;
+    }
+    ping();
+  }, 4500);
+  actTimers.set(user.id, iv);
+}
+
+/** Одно сообщение «в очереди: N» на пользователя — альбом из 10 видео не даёт 10 сообщений */
+const notes = new Map(); // user.id → { id, timer, text }
+function queueNote(user, chatId) {
+  const n = notes.get(user.id) || {};
+  notes.set(user.id, n);
+  clearTimeout(n.timer);
+  n.timer = setTimeout(async () => {
+    const w = waiting.get(user.id) || 0;
+    const text = w > 0 ? `📥 Ещё в очереди: <b>${w}</b>. Обрабатываю по одному — у каждого файла будет своё сообщение со статусом.` : '';
+    if (text === n.text) return;
+    n.text = text;
+    if (!text) {
+      if (n.id) await tg('deleteMessage', { chat_id: chatId, message_id: n.id }).catch(() => {});
+      n.id = null;
+    } else if (n.id) await edit(chatId, n.id, text);
+    else n.id = (await send(chatId, text).catch(() => ({}))).message_id || null;
+  }, 800);
+}
+
+/**
+ * Статус задачи в одном сообщении: текст этапа + сколько времени идёт.
+ * Таймер обновляется каждые 10 секунд, чтобы было видно, что бот не завис.
+ */
+async function progress(user, chatId, first) {
+  const msg = await send(chatId, `${first}`);
+  const t0 = Date.now();
+  let text = first;
+  let alive = true;
+  const draw = () => edit(chatId, msg.message_id, `${text} <i>${fmtDur((Date.now() - t0) / 1000)}</i>`);
+  const iv = setInterval(() => alive && draw(), 10000);
+  // запоминаем, чтобы после перезапуска сервера честно написать, что задача прервалась
+  user.live = (user.live || []).filter((x) => x.id !== msg.message_id).concat({ chatId, id: msg.message_id, text: first });
+  saveUser(user).catch(() => {});
+  return {
+    id: msg.message_id,
+    set(t) {
+      text = t;
+      const l = (user.live || []).find((x) => x.id === msg.message_id);
+      if (l) l.text = t;
+      return alive ? draw() : null;
+    },
+    async done(t, extra) {
+      alive = false;
+      clearInterval(iv);
+      user.live = (user.live || []).filter((x) => x.id !== msg.message_id);
+      if (t === null) return tg('deleteMessage', { chat_id: chatId, message_id: msg.message_id }).catch(() => {});
+      return edit(chatId, msg.message_id, t, extra);
+    },
+  };
 }
 
 // ───────────────────────────── Работа с примерами ─────────────────────────────
@@ -693,8 +896,8 @@ async function aiAnalyze(user, ex) {
 
 async function processExample(user, chatId, v) {
   const n = ++user.seq;
-  const st = await send(chatId, `⏳ Пример ${n}: получаю файл…`);
-  const say = (t) => edit(chatId, st.message_id, t);
+  const st = await progress(user, chatId, `⏳ Пример ${n}: получаю файл…`);
+  const say = (t) => st.set(t);
   const dir = path.join(userDir(user.id), 'examples');
   await fsp.mkdir(dir, { recursive: true });
   const ext = (path.extname(v.name) || '.mp4').toLowerCase().replace(/[^.a-z0-9]/g, '') || '.mp4';
@@ -710,21 +913,33 @@ async function processExample(user, chatId, v) {
     const cuts = await detectCuts(file, meta);
     const ex = { n, file: path.basename(file), addedAt: new Date().toISOString(), meta, cuts, shots: shotStats(cuts, meta.duration), audio: await audioStats(file, meta), ai: null };
     user.examples.push(ex);
+    dropInbox(user, v);
     await saveUser(user);
     await say(`⏳ Пример ${n}: смотрю ролик и разбираю приёмы…`);
     const head = `Пример ${n} · ${num(meta.duration, 0)} с · ${cuts.length} ${plural(cuts.length, 'склейка', 'склейки', 'склеек')} · план ≈${num(ex.shots.avg)} с`;
     try {
       await aiAnalyze(user, ex);
-      await say(`✅ ${head}${ex.ai.type ? ` · ${esc(txt(ex.ai.type))}` : ''}`);
+      await st.done(`✅ ${head}${ex.ai.type ? ` · ${esc(txt(ex.ai.type))}` : ''}`);
     } catch (e) {
       ex.aiError = e.message;
       log('ai:', e.message);
-      await say(`⚠️ ${head}\nТемп измерил, но разобрать приёмы не удалось: ${esc(e.message)}. Повторю попытку при сборке паспорта.`);
+      await st.done(`⚠️ ${head}\nТемп измерил, но разобрать приёмы не удалось: ${esc(e.message)}. Повторю попытку при сборке паспорта.`);
     }
   } catch (e) {
+    dropInbox(user, v);
     await fsp.unlink(file).catch(() => {});
-    await say(`⚠️ Пример ${n} не принят: ${esc(e.message)}.`);
+    await st.done(`⚠️ Пример ${n} не принят: ${esc(e.message)}.`);
   }
+}
+
+// ───────────────────────────── Входящие файлы переживают перезапуск ─────────────────────────────
+
+function addInbox(user, type, m) {
+  user.inbox = (user.inbox || []).concat({ type, m, at: new Date().toISOString() });
+  saveUser(user).catch(() => {});
+}
+function dropInbox(user, m) {
+  user.inbox = (user.inbox || []).filter((x) => x.m.fileId !== m.fileId);
 }
 
 async function afterExamples(user, chatId) {
@@ -743,28 +958,37 @@ async function buildPassport(user, chatId) {
     await send(chatId, 'Пока нет ни одного разобранного примера. Пришлите сюда свои готовые ролики.');
     return;
   }
-  const st = await send(chatId, '🧠 Собираю паспорт стиля…');
-  // Примеры, где ИИ-разбор не удался в прошлый раз, пробуем ещё раз
-  for (const ex of user.examples.filter((e) => !e.ai)) {
-    await edit(chatId, st.message_id, `🧠 Повторно разбираю пример ${ex.n}…`);
-    await aiAnalyze(user, ex).catch((e) => (ex.aiError = e.message));
-  }
-  const ready = user.examples.filter((e) => e.ai);
-  if (!ready.length) {
-    await edit(chatId, st.message_id, `⚠️ Не удалось разобрать примеры: ${esc(user.examples[0].aiError || 'ИИ-сервис недоступен')}. Попробуйте позже.`);
+  const st = await progress(user, chatId, '🧠 Собираю паспорт стиля…');
+  let data;
+  let agg;
+  let ready;
+  try {
+    // Примеры, где ИИ-разбор не удался в прошлый раз, пробуем ещё раз
+    for (const ex of user.examples.filter((e) => !e.ai)) {
+      await st.set(`🧠 Повторно разбираю пример ${ex.n}…`);
+      await aiAnalyze(user, ex).catch((e) => (ex.aiError = e.message));
+    }
+    ready = user.examples.filter((e) => e.ai);
+    if (!ready.length) {
+      await st.done(`⚠️ Не удалось разобрать примеры: ${esc(user.examples[0].aiError || 'ИИ-сервис недоступен')}. Попробуйте позже.`);
+      return;
+    }
+    await st.set('🧠 Собираю паспорт стиля…');
+    agg = aggregate(ready);
+    data = await geminiJson(user, [{ text: promptPassport(user, ready, agg) }]);
+  } catch (e) {
+    await st.done(`⚠️ Собрать паспорт не получилось: ${esc(e.message)}`);
     return;
   }
-  const agg = aggregate(ready);
-  const data = await geminiJson(user, [{ text: promptPassport(user, ready, agg) }]);
   user.prevPassport = null;
   user.passport = { version: ((user.passport && user.passport.version) || 0) + 1, confirmed: false, createdAt: new Date().toISOString(), measured: agg, data };
   await saveUser(user);
-  await tg('deleteMessage', { chat_id: chatId, message_id: st.message_id }).catch(() => {});
+  await st.done(null);
   await sendLong(chatId, renderPassport(user), { reply_markup: kb([[['✅ Всё верно', 'ok'], ['✏️ Поправить', 'fix']]]) });
 }
 
 async function applyCorrection(user, chatId, text) {
-  const st = await send(chatId, '✏️ Вношу правку в паспорт…');
+  const st = await progress(user, chatId, '✏️ Вношу правку в паспорт…');
   user.corrections.push({ text, at: new Date().toISOString() });
   try {
     const data = await geminiJson(user, [{ text: promptCorrection(user, text) }]);
@@ -772,10 +996,10 @@ async function applyCorrection(user, chatId, text) {
     user.passport = { ...user.passport, version: user.passport.version + 1, confirmed: false, createdAt: new Date().toISOString(), data };
   } catch (e) {
     user.corrections.pop();
-    throw e;
-  } finally {
-    await tg('deleteMessage', { chat_id: chatId, message_id: st.message_id }).catch(() => {});
+    await st.done(`⚠️ Правку внести не получилось: ${esc(e.message)}`);
+    return;
   }
+  await st.done(null);
   await saveUser(user);
   await sendLong(chatId, renderPassport(user), { reply_markup: kb([[['✅ Принять', 'ok'], ['↩️ Вернуть прежний', 'undo']]]) });
 }
@@ -802,6 +1026,7 @@ function newProject(user) {
 async function resetProject(user) {
   await fsp.rm(projDir(user), { recursive: true, force: true }).catch(() => {});
   user.hold = [];
+  user.inbox = (user.inbox || []).filter((x) => x.type !== 'source');
   return newProject(user);
 }
 
@@ -953,37 +1178,154 @@ function promptShots(src) {
 - what — что в кадре, 4–12 слов, конкретно (не «красивый кадр», а «нарезка лосося крупным планом»);
 - quality: "good" | "ok" | "bad".
 Однородные куски длиннее 12 с дели на части. Планы должны покрывать всё видео без пропусков.
+Ещё укажи "speech": true, если в видео слышна речь человека (в кадре или за кадром), и false, если только шум, музыка или тишина.
 
 Ответь строго одним JSON-объектом без пояснений:
-{"shots": [{"start": 0, "end": 4.5, "kind": "broll", "what": "...", "quality": "good"}]}`;
+{"speech": false, "shots": [{"start": 0, "end": 4.5, "kind": "broll", "what": "...", "quality": "good"}]}`;
 }
 
 /** Расшифровка речи и описание планов. Уже сделанное не повторяется. */
-async function analyzeSource(user, src) {
+/** Есть ли в ролике отдельная озвучка (уже принята или ещё в очереди) */
+function hasVoiceover(user) {
+  const p = user.project;
+  return !!p && (p.sources.some((s) => s.kind === 'audio') || (user.inbox || []).some((x) => x.type === 'source' && x.m.kind === 'audio'));
+}
+
+/** Нужна ли этому исходнику ещё работа ИИ */
+function needsAnalysis(user, s) {
+  const ai = s.ai || {};
+  if (s.kind === 'video' && !ai.shots) return true;
+  if (ai.phrases) return false;
+  return s.kind === 'audio' || !hasVoiceover(user);
+}
+
+/**
+ * Разбор исходника. Видео: сначала планы (и есть ли в нём речь), потом — только если речь
+ * нужна — расшифровка. Если есть отдельная озвучка, речь из видео не нужна и не расшифровывается.
+ */
+async function analyzeSource(user, src, opts = {}) {
   const dir = projDir(user);
   src.ai = src.ai || {};
-  if (!src.ai.phrases) {
-    if (!src.hasAudio || !src.wav || src.speechShare < 0.04) {
-      src.ai.phrases = [];
-      src.ai.language = 'none';
-    } else {
-      const up = await geminiUpload(path.join(dir, src.wav));
-      try {
-        const j = await geminiJson(user, [{ file_data: { mime_type: up.mime, file_uri: up.uri } }, { text: promptTranscribe(src) }], { long: true });
-        src.ai.language = txt(j.language) || '';
-        src.ai.phrases = snapPhrases(j.phrases, src.silences || [], src.duration).map((p, i) => ({ id: `${src.n}.${i + 1}`, ...p }));
-      } finally {
-        geminiDelete(up.name);
-      }
-    }
-  }
   if (src.kind === 'video' && !src.ai.shots) {
-    const up = await geminiUpload(path.join(dir, src.file), 15 * 60 * 1000);
+    // короткие видео разбираются пачкой — один запрос к ИИ на несколько файлов
+    const j = src.duration <= CFG.batchMaxSec ? await shotsBatched(user, src, opts) : await aiSlot(() => shotsSingle(user, src, opts));
+    src.ai.hasSpeech = j.speech !== false;
+    src.ai.shots = normShots(j.shots, src).map((s, i) => ({ id: `${src.n}#${i + 1}`, ...s }));
+  }
+  if (src.ai.phrases) return;
+  const noSpeech = !src.hasAudio || !src.wav || src.speechShare < 0.04 || (src.kind === 'video' && src.ai.hasSpeech === false);
+  if (noSpeech) {
+    src.ai.phrases = [];
+    src.ai.language = 'none';
+    return;
+  }
+  if (src.kind === 'video' && hasVoiceover(user)) return; // речь видео не нужна — поверх идёт озвучка
+  await aiSlot(async () => {
+    const up = await geminiUpload(path.join(dir, src.wav));
     try {
-      const j = await geminiJson(user, [{ file_data: { mime_type: up.mime, file_uri: up.uri } }, { text: promptShots(src) }], { long: true, lowRes: true });
-      src.ai.shots = normShots(j.shots, src).map((s, i) => ({ id: `${src.n}#${i + 1}`, ...s }));
+      const j = await geminiJson(user, [{ file_data: { mime_type: up.mime, file_uri: up.uri } }, { text: promptTranscribe(src) }], { long: true, fast: true, onWait: opts.onWait });
+      src.ai.language = txt(j.language) || '';
+      src.ai.phrases = snapPhrases(j.phrases, src.silences || [], src.duration).map((p, i) => ({ id: `${src.n}.${i + 1}`, ...p }));
     } finally {
       geminiDelete(up.name);
+    }
+  });
+}
+
+async function shotsSingle(user, src, opts = {}) {
+  const up = await geminiUpload(path.join(projDir(user), src.file), 15 * 60 * 1000);
+  try {
+    return await geminiJson(user, [{ file_data: { mime_type: up.mime, file_uri: up.uri } }, { text: promptShots(src) }], { long: true, lowRes: true, fast: true, onWait: opts.onWait });
+  } finally {
+    geminiDelete(up.name);
+  }
+}
+
+// ── Пакетный разбор коротких видео: альбом из 10 перебивок — 1–2 запроса вместо 10 ──
+const shotBatches = new Map(); // user.id → { items, timer }
+
+function shotsBatched(user, src, opts = {}) {
+  return new Promise((resolve, reject) => {
+    let b = shotBatches.get(user.id);
+    if (!b) {
+      b = { items: [] };
+      shotBatches.set(user.id, b);
+    }
+    b.items.push({ src, resolve, reject, onWait: opts.onWait });
+    clearTimeout(b.timer);
+    const flush = () => {
+      clearTimeout(b.timer);
+      if (shotBatches.get(user.id) === b) shotBatches.delete(user.id);
+      runShotBatch(user, b.items);
+    };
+    const total = b.items.reduce((s, x) => s + x.src.duration, 0);
+    if (b.items.length >= CFG.batchMax || total >= CFG.batchMaxSec * 3) flush();
+    // в очереди ещё есть файлы — ждём их; очередь пуста — отправляем почти сразу
+    else b.timer = setTimeout(flush, (waiting.get(user.id) || 0) > 0 ? 8000 : 1500);
+  });
+}
+
+function promptShotsBatch(n) {
+  return `Выше ${n} исходных видео для монтажа одного ролика, каждое подписано номером («Файл 1», «Файл 2»…). Для КАЖДОГО файла отдельно раздели видео на планы — непрерывные куски с одним содержанием — и опиши каждый так, чтобы монтажёр мог выбрать перебивки, не глядя видео.
+
+Для каждого плана:
+- start, end — секунды от начала ЭТОГО файла, точность 0,1 с;
+- kind: "talking" — человек говорит в камеру; "broll" — то, что годится в перебивку (продукт, процесс, место, детали, люди без синхрона); "junk" — брак: тряска, расфокус, камера смотрит в пол, случайная съёмка;
+- what — что в кадре, 4–12 слов, конкретно (не «красивый кадр», а «нарезка лосося крупным планом»);
+- quality: "good" | "ok" | "bad".
+Планы должны покрывать весь файл без пропусков. Для каждого файла укажи "speech": true, если в нём слышна речь человека, и false, если только шум, музыка или тишина.
+
+Ответь строго одним JSON-объектом без пояснений, по одному элементу на каждый файл:
+{"files": [{"file": 1, "speech": false, "shots": [{"start": 0, "end": 4.5, "kind": "broll", "what": "...", "quality": "good"}]}]}`;
+}
+
+async function runShotBatch(user, items) {
+  if (items.length === 1) {
+    const it = items[0];
+    try {
+      it.resolve(await aiSlot(() => shotsSingle(user, it.src, { onWait: it.onWait })));
+    } catch (e) {
+      it.reject(e);
+    }
+    return;
+  }
+  const onWait = (t) => Promise.all(items.map((x) => (x.onWait ? x.onWait(t) : null)));
+  const ups = [];
+  try {
+    await aiSlot(async () => {
+      for (const it of items) ups.push(await geminiUpload(path.join(projDir(user), it.src.file), 15 * 60 * 1000));
+      const parts = [];
+      items.forEach((it, i) => {
+        parts.push({ text: `Файл ${i + 1} (длительность ${it.src.duration.toFixed(1)} с, кадр ${it.src.width}×${it.src.height}):` });
+        parts.push({ file_data: { mime_type: ups[i].mime, file_uri: ups[i].uri } });
+      });
+      parts.push({ text: promptShotsBatch(items.length) });
+      const j = await geminiJson(user, parts, { long: true, lowRes: true, fast: true, onWait });
+      const files = Array.isArray(j.files) ? j.files : [];
+      items.forEach((it, i) => {
+        const f = files.find((x) => Number(x && x.file) === i + 1) || files[i];
+        if (f && Array.isArray(f.shots)) it.resolve(f);
+        else it.reject(new Error('ИИ пропустил этот файл'));
+      });
+    });
+  } catch (e) {
+    items.forEach((it) => it.reject(e));
+  } finally {
+    ups.forEach((u) => geminiDelete(u.name));
+  }
+}
+
+/** Разбор с ожиданием, если Google перегружен: до трёх заходов с паузой в минуту */
+async function analyzePatiently(user, src, say) {
+  for (let round = 1; ; round++) {
+    try {
+      await analyzeSource(user, src, { onWait: (t) => say(`⏳ Исходник ${src.n}: ${t}…`) });
+      delete src.aiError;
+      return;
+    } catch (e) {
+      if (e.quota || !e.overload || round >= 3) throw e;
+      await say(`⏳ Исходник ${src.n}: серверы Google перегружены — повторю через минуту (попытка ${round + 1} из 3)…`);
+      await sleep(60000);
     }
   }
 }
@@ -994,6 +1336,7 @@ function sourceLine(src) {
   const kind = src.kind === 'audio' ? 'озвучка' : 'видео';
   const parts = [`Исходник ${src.n} · ${kind} ${fmtDur(src.duration)}`];
   const ai = src.ai || {};
+  if (!ai.phrases && src.kind === 'video' && ai.shots) parts.push(ai.hasSpeech === false ? 'без речи' : 'речь не нужна — есть озвучка');
   if (ai.phrases) parts.push(ai.phrases.length ? `речь: ${ai.phrases.length} ${plural(ai.phrases.length, 'фраза', 'фразы', 'фраз')}${LANG[ai.language] ? ` (${LANG[ai.language]})` : ''}` : 'без речи');
   if (ai.shots) {
     const b = ai.shots.filter((s) => s.kind === 'broll' && s.quality !== 'bad').length;
@@ -1005,8 +1348,8 @@ function sourceLine(src) {
 async function processSource(user, chatId, m) {
   const p = user.project;
   const n = ++p.seq;
-  const st = await send(chatId, `⏳ Исходник ${n}: получаю файл…`);
-  const say = (t) => edit(chatId, st.message_id, t);
+  const st = await progress(user, chatId, `⏳ Исходник ${n}: получаю файл…`);
+  const say = (t) => st.set(t);
   const dir = projDir(user);
   await fsp.mkdir(dir, { recursive: true });
   const ext = (path.extname(m.name) || (m.kind === 'audio' ? '.ogg' : '.mp4')).toLowerCase().replace(/[^.a-z0-9]/g, '') || '.mp4';
@@ -1041,29 +1384,55 @@ async function processSource(user, chatId, m) {
     if (src.kind === 'audio' && !src.hasAudio) throw new Error('не удалось прочитать звук');
     if (user.project !== p) throw new Error('пока файл загружался, вы начали новый ролик');
     p.sources.push(src);
+    dropInbox(user, m);
     await saveUser(user);
-    await say(`⏳ Исходник ${n}: ${src.kind === 'audio' ? 'расшифровываю речь' : 'расшифровываю речь и смотрю кадры'}…`);
-    try {
-      await analyzeSource(user, src);
-      delete src.aiError;
-      await say(sourceLine(src));
-    } catch (e) {
-      src.aiError = e.message;
-      log('source ai:', e.message);
-      await say(`${sourceLine(src)}\nРазобрать не удалось: ${esc(e.message)}. Повторю попытку при монтаже.`);
-    }
+    // Разбор ИИ идёт параллельно: очередь сразу берёт следующий файл
+    await say(`⏳ Исходник ${n}: жду очереди к ИИ…`);
+    background(user, chatId, () =>
+      (async () => {
+        await say(`⏳ Исходник ${n}: ${src.kind === 'audio' ? 'расшифровываю речь' : 'смотрю кадры'}…`);
+        try {
+          await analyzePatiently(user, src, say);
+          await st.done(sourceLine(src));
+        } catch (e) {
+          src.aiError = e.message;
+          log('source ai:', e.message);
+          await st.done(`📥 Исходник ${n} принят (${src.kind === 'audio' ? 'озвучка' : 'видео'} ${fmtDur(src.duration)}). Разобрать пока не удалось: ${esc(e.message)}${e.quota ? '' : '. Повторю сам при монтаже'}.`);
+        }
+      })()
+    ).then(() => setTimeout(() => afterSources(user, chatId).catch(() => {}), 50));
   } catch (e) {
+    dropInbox(user, m);
     await fsp.unlink(file).catch(() => {});
-    await say(`⚠️ Исходник ${n} не принят: ${esc(e.message)}.`);
+    await st.done(`⚠️ Исходник ${n} не принят: ${esc(e.message)}.`);
+  }
+}
+
+/** Не больше CFG.aiParallel разборов ИИ одновременно */
+let aiActive = 0;
+const aiWaiters = [];
+async function aiSlot(fn) {
+  while (aiActive >= CFG.aiParallel) await new Promise((r) => aiWaiters.push(r));
+  aiActive++;
+  try {
+    return await fn();
+  } finally {
+    aiActive--;
+    const next = aiWaiters.shift();
+    if (next) next();
   }
 }
 
 const montageKb = (p) => kb([[['🎬 Смонтировать', 'm_go'], ['🗑 Очистить', 'm_clear']]]);
 
+/** Итог по исходникам — когда всё принято и разобрано */
 async function afterSources(user, chatId) {
-  if ((pending.get(user.id) || 0) > 1) return; // ещё есть файлы в очереди
+  if (isBusy(user)) return; // ещё есть файлы в очереди или идёт разбор
   const p = user.project;
   if (!p || !p.sources.length) return;
+  const sig = p.sources.map((s) => s.n).join(',');
+  if (p.summarySig === sig) return; // этот набор уже показан
+  p.summarySig = sig;
   const v = p.sources.filter((s) => s.kind === 'video').length;
   const a = p.sources.length - v;
   const what = [v ? `видео: ${v}` : '', a ? `озвучка: ${a}` : ''].filter(Boolean).join(', ');
@@ -1087,10 +1456,13 @@ function projectContext(user) {
   const allShots = p.sources.filter((s) => s.kind === 'video' && s.ai && s.ai.shots).flatMap((s) => s.ai.shots.map((x) => ({ ...x, src: s.n })));
   let shots = allShots.filter((s) => s.kind === 'broll' && s.quality !== 'bad');
   if (!shots.length) shots = allShots.filter((s) => s.kind === 'broll');
-  if (voiceover && !shots.length) shots = allShots.filter((s) => s.kind !== 'junk');
-  if (voiceover && !shots.length) shots = allShots;
+  // Без речи вообще — ролик собирается только из картинки
+  const visual = !phrases.length;
+  if ((voiceover || visual) && !shots.length) shots = allShots.filter((s) => s.kind !== 'junk');
+  if ((voiceover || visual) && !shots.length) shots = allShots;
   return {
     voiceover,
+    visual,
     phrases,
     shots,
     bySrc: new Map(p.sources.map((s) => [s.n, s])),
@@ -1121,9 +1493,31 @@ function catalogText(ctx) {
 
 const PLAN_SCHEMA = `{"idea": "о чём ролик, одна фраза", "keep": ["1.3", "1.5"], "broll": [{"phrase": "1.5", "shot": "2#3", "offset": 0.5, "dur": 2}], "cover": [{"phrase": "3.1", "shots": ["1#2", "2#5"]}], "zoom": ["1.3"], "jumpcut_zoom": false, "cut_pauses": true, "subtitles": {"on": true, "position": "bottom", "size": "medium", "color": "#FFFFFF", "highlight": "#FFD400", "uppercase": false, "words": 3, "style": "outline"}, "notes": ["..."]}`;
 
+const VISUAL_SCHEMA = `{"idea": "о чём ролик, одна фраза", "sequence": [{"shot": "1#2", "dur": 1.5}, {"shot": "3#1", "dur": 2}], "keep_sound": true, "notes": ["..."]}`;
+
+function promptVisual(user, ctx, wishes) {
+  return `Ты — монтажёр автора. Собери ролик только из видеоряда (речи нет) так, как его смонтировал бы сам автор, по его «паспорту стиля».
+
+Паспорт стиля (JSON):
+${JSON.stringify(passportBrief(user))}
+${measuredLine(user)}
+${wishes ? `\nПожелания автора к этому ролику (они важнее паспорта):\n${wishes}\n` : ''}
+Планы видео (id | секунды | вид, качество | что в кадре):
+${ctx.shots.map((x) => `${x.id} | ${r2(x.start)}–${r2(x.end)} (${num(x.end - x.start)} с) | ${x.kind}, ${x.quality} | ${x.what}`).join('\n')}
+
+Как собирать:
+1. "sequence" — планы в порядке показа и длительность каждого в секундах (dur не больше длины плана). Начни с самого цепляющего кадра. Темп и длина ролика — как у автора, если в пожеланиях не сказано иначе. Брак и слабые планы не бери. Один план — один раз.
+2. "keep_sound" — true, если живой звук планов стоит оставить (шипение, нарезка); false — если там шум и лучше тишина под будущую музыку.
+3. "notes" — 2–4 коротких пункта для автора: что сделано.
+
+Используй только id из списка. Ответь строго одним JSON-объектом без пояснений, тексты на русском:
+${VISUAL_SCHEMA}`;
+}
+
 function promptPlan(user, ctx) {
   const p = user.project;
   const wishes = [...p.brief, ...p.fixes].map((t, i) => `${i + 1}. ${t}`).join('\n');
+  if (ctx.visual) return promptVisual(user, ctx, wishes);
   return `Ты — монтажёр автора. Собери из исходников новый ролик так, как его смонтировал бы сам автор, строго по его «паспорту стиля».
 
 Паспорт стиля (JSON):
@@ -1152,6 +1546,7 @@ ${PLAN_SCHEMA}`;
 
 /** План в том виде, в котором его видит ИИ */
 function planForAi(plan) {
+  if (plan.sequence && plan.sequence.length) return { idea: plan.idea, sequence: plan.sequence, keep_sound: plan.keepSound };
   return { idea: plan.idea, keep: plan.keep, broll: plan.broll, cover: plan.cover, zoom: plan.zoom, jumpcut_zoom: plan.jumpcutZoom, cut_pauses: plan.cutPauses, subtitles: plan.subtitles };
 }
 
@@ -1170,7 +1565,7 @@ function promptFix(user, ctx, text) {
 Паспорт стиля (JSON):
 ${JSON.stringify(passportBrief(user))}
 
-Режим: ${ctx.voiceover ? 'ОЗВУЧКА (видеоряд — поле "cover")' : 'РЕЧЬ В КАДРЕ (перебивки — поле "broll")'}
+Режим: ${ctx.visual ? 'БЕЗ РЕЧИ (видеоряд — поле "sequence")' : ctx.voiceover ? 'ОЗВУЧКА (видеоряд — поле "cover")' : 'РЕЧЬ В КАДРЕ (перебивки — поле "broll")'}
 
 ${catalogText(ctx)}
 
@@ -1181,7 +1576,7 @@ ${earlier ? `\nПрежние правки автора (уже учтены, н
 «${text}»
 
 Ответь строго одним JSON-объектом без пояснений, по образцу:
-${PLAN_SCHEMA}`;
+${ctx.visual ? VISUAL_SCHEMA : PLAN_SCHEMA}`;
 }
 
 function hexColor(v, fallback) {
@@ -1192,11 +1587,21 @@ function hexColor(v, fallback) {
 /** Проверка ответа ИИ: только существующие куски, разумные числа */
 function normalizePlan(raw, ctx) {
   const r = raw && typeof raw === 'object' ? raw : {};
+  const shotId = (x) => String(x && typeof x === 'object' ? x.shot || x.id : x);
+  const notesOf = () => (Array.isArray(r.notes) ? r.notes : []).map(txt).filter(Boolean).slice(0, 6);
+  if (ctx.visual) {
+    let sequence = (Array.isArray(r.sequence) ? r.sequence : [])
+      .map((x) => ({ shot: shotId(x), dur: Number(x && x.dur) || 0 }))
+      .filter((x) => ctx.shotById.has(x.shot) && x.dur >= 0.4);
+    if (!sequence.length) sequence = ctx.shots.map((s) => ({ shot: s.id, dur: Math.min(2.5, s.end - s.start) })).filter((x) => x.dur >= 0.4);
+    if (!sequence.length) throw new Error('нет подходящих планов для ролика');
+    const off = { on: false, position: 'bottom', size: 'medium', color: '#FFFFFF', highlight: '', uppercase: false, words: 3, style: 'outline' };
+    return { idea: txt(r.idea).slice(0, 300), keep: [], broll: [], cover: [], zoom: [], jumpcutZoom: false, cutPauses: false, subtitles: off, notes: notesOf(), sequence, keepSound: r.keep_sound !== false };
+  }
   const seen = new Set();
   const keep = (Array.isArray(r.keep) ? r.keep : []).map(String).filter((id) => ctx.phraseById.has(id) && !seen.has(id) && seen.add(id));
   if (!keep.length) throw new Error('ИИ не выбрал ни одного куска речи');
   const kept = new Set(keep);
-  const shotId = (x) => String(x && typeof x === 'object' ? x.shot || x.id : x);
   const broll = (Array.isArray(r.broll) ? r.broll : [])
     .map((b) => ({ phrase: String(b && b.phrase), shot: shotId(b), offset: Math.max(0, Number(b && b.offset) || 0), dur: Number(b && b.dur) || 0, from: b && b.from != null && isFinite(Number(b.from)) ? Number(b.from) : null }))
     .filter((b) => kept.has(b.phrase) && ctx.shotById.has(b.shot) && b.dur >= 0.4);
@@ -1294,6 +1699,24 @@ function buildTimeline(plan, ctx, fps = CFG.fps) {
   const chunks = [];
   const span = new Map();
   let f = 0;
+  if (ctx.visual) {
+    // Без речи: планы подряд, звук — живой звук этих же планов или тишина
+    const pieces = [];
+    for (const it of plan.sequence) {
+      const shot = ctx.shotById.get(it.shot);
+      const avail = shot.end - shot.start;
+      const dur = Math.min(it.dur, avail);
+      const n = Math.round(dur * fps);
+      if (n < 3) continue;
+      const from = shot.start + Math.max(0, (avail - dur) / 2);
+      const src = ctx.bySrc.get(shot.src);
+      pieces.push({ f0: f, f1: f + n, src: shot.src, from, zoom: 1, broll: true });
+      chunks.push({ phrase: null, src: shot.src, a: from, f0: f, f1: f + n, mute: !plan.keepSound || !src.hasAudio });
+      f += n;
+    }
+    if (!f) throw new Error('планы получились слишком короткими');
+    return { chunks, pieces, total: f, span, fps };
+  }
   for (const id of plan.keep) {
     const ph = ctx.phraseById.get(id);
     const src = ctx.bySrc.get(ph.src);
@@ -1509,7 +1932,12 @@ async function renderMontage(user, ctx, plan, say) {
       const c = tl.chunks[i];
       const len = (c.f1 - c.f0) / fps;
       const out = path.join(work, `a${i}.wav`);
-      await ff(['-y', '-ss', c.a.toFixed(3), '-i', srcFile(c.src), '-vn', '-ac', '2', '-ar', '48000', '-af', `apad,atrim=0:${len.toFixed(4)},afade=t=in:d=0.008,afade=t=out:st=${Math.max(0, len - 0.012).toFixed(4)}:d=0.012`, '-c:a', 'pcm_s16le', out], 'вырезать звук');
+      if (c.mute) {
+        await ff(['-y', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', len.toFixed(4), '-c:a', 'pcm_s16le', out], 'подготовить тишину');
+      } else {
+        const fade = ctx.visual ? 0.15 : 0.01; // между планами без речи звук мягко перетекает
+        await ff(['-y', '-ss', c.a.toFixed(3), '-i', srcFile(c.src), '-vn', '-ac', '2', '-ar', '48000', '-af', `apad,atrim=0:${len.toFixed(4)},afade=t=in:d=${fade * 0.8},afade=t=out:st=${Math.max(0, len - fade).toFixed(4)}:d=${fade}`, '-c:a', 'pcm_s16le', out], 'вырезать звук');
+      }
       aFiles.push(out);
     }
     await fsp.writeFile(path.join(work, 'a.txt'), list(aFiles));
@@ -1557,10 +1985,10 @@ async function renderMontage(user, ctx, plan, say) {
     p.version += 1;
     const out = path.join(dir, `result-${p.version}.mp4`);
     await ff(
-      ['-y', '-i', video, '-i', audio, '-map', '0:v:0', '-map', '1:a:0', ...(vf ? ['-vf', vf, '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p'] : ['-c:v', 'copy']), '-af', 'loudnorm=I=-14:TP=-1.5:LRA=11', '-ar', '48000', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-shortest', out],
+      ['-y', '-i', video, '-i', audio, '-map', '0:v:0', '-map', '1:a:0', ...(vf ? ['-vf', vf, '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p'] : ['-c:v', 'copy']), '-af', ctx.visual ? 'volume=0.7' : 'loudnorm=I=-14:TP=-1.5:LRA=11', '-ar', '48000', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-shortest', out],
       'собрать итоговый ролик'
     );
-    return { v: p.version, file: path.basename(out), duration: tl.total / fps, width: W, height: H, chunks: tl.chunks.length, broll: tl.pieces.filter((x) => x.broll).length, subsNote, at: new Date().toISOString() };
+    return { v: p.version, visual: !!ctx.visual, file: path.basename(out), duration: tl.total / fps, width: W, height: H, chunks: tl.chunks.length, broll: tl.pieces.filter((x) => x.broll).length, subsNote, at: new Date().toISOString() };
   } finally {
     await fsp.rm(work, { recursive: true, force: true }).catch(() => {});
   }
@@ -1592,7 +2020,7 @@ function resultCaption(p, extraNote) {
   const plan = p.plan;
   const L = [`🎬 <b>Ролик · вариант ${r.v || p.version}</b> · ${fmtDur(r.duration)}`];
   if (plan.idea) L.push(esc(plan.idea));
-  const facts = [`кусков речи: ${r.chunks}`, r.broll ? `перебивок: ${r.broll}` : '', plan.subtitles.on ? 'субтитры: да' : 'без субтитров'].filter(Boolean);
+  const facts = r.visual ? [`планов: ${r.chunks}`, 'без речи', plan.keepSound ? 'живой звук' : 'без звука — под музыку'] : [`кусков речи: ${r.chunks}`, r.broll ? `перебивок: ${r.broll}` : '', plan.subtitles.on ? 'субтитры: да' : 'без субтитров'].filter(Boolean);
   L.push(facts.join(' · '));
   for (const n of plan.notes.slice(0, 4)) L.push(`• ${esc(n)}`);
   if (extraNote) L.push(`⚠️ ${esc(extraNote)}`);
@@ -1610,25 +2038,33 @@ async function makeMontage(user, chatId, fixText) {
   if (!user.passport) return void (await send(chatId, 'Сначала научите меня своему стилю: /learn'));
   if (!p || !p.sources.length) return void (await send(chatId, 'Пришлите исходники ролика: видео, перебивки, озвучку.'));
   if (fixText && !p.plan) fixText = '';
-  const st = await send(chatId, fixText ? '✏️ Вношу правку…' : '🎬 Начинаю монтаж…');
-  const say = (t) => edit(chatId, st.message_id, t);
+  const st = await progress(user, chatId, fixText ? '✏️ Вношу правку…' : '🎬 Начинаю монтаж…');
+  const say = (t) => st.set(t);
   try {
-    for (const s of p.sources.filter((x) => x.aiError || !x.ai || !x.ai.phrases || (x.kind === 'video' && !x.ai.shots))) {
-      await say(`🎬 Разбираю исходник ${s.n}…`);
-      try {
-        await analyzeSource(user, s);
-        delete s.aiError;
-      } catch (e) {
-        s.aiError = e.message;
-      }
+    const bg = [...(bgJobs.get(user.id) || [])];
+    if (bg.length) {
+      await say(`⏳ Дожидаюсь разбора исходников (осталось: ${bg.length})…`);
+      await Promise.all(bg);
     }
+    const todo = p.sources.filter((x) => needsAnalysis(user, x));
+    await Promise.all(
+      todo.map(async (s) => {
+        await say(`🎬 Разбираю исходники: ${todo.length}…`);
+        try {
+          await analyzePatiently(user, s, say);
+        } catch (e) {
+          s.aiError = e.message;
+          if (e.quota) throw e;
+        }
+      })
+    );
     const ctx = projectContext(user);
-    if (!ctx.phrases.length) {
+    if (!ctx.phrases.length && !ctx.shots.length) {
       const err = p.sources.find((s) => s.aiError);
-      throw new Error(err ? `не удалось расшифровать речь: ${err.aiError}` : 'не нашёл речи ни в одном исходнике. Пришлите видео, где вы говорите, или озвучку голосовым');
+      throw new Error(err ? `не удалось разобрать исходники: ${err.aiError}` : 'в исходниках нечего монтировать');
     }
-    await say(fixText ? '✏️ Меняю план монтажа…' : '🧠 Выбираю лучшие дубли и подбираю перебивки…');
-    const raw = await geminiJson(user, [{ text: fixText ? promptFix(user, ctx, fixText) : promptPlan(user, ctx) }], { long: true });
+    await say(fixText ? '✏️ Меняю план монтажа…' : ctx.visual ? '🧠 Подбираю планы и темп…' : '🧠 Выбираю лучшие дубли и подбираю перебивки…');
+    const raw = await geminiJson(user, [{ text: fixText ? promptFix(user, ctx, fixText) : promptPlan(user, ctx) }], { long: true, onWait: (t) => say(`🧠 ${t}…`) });
     const plan = normalizePlan(raw, ctx);
     const res = await renderMontage(user, ctx, plan, say);
     // старый прошлый вариант больше не нужен
@@ -1643,9 +2079,9 @@ async function makeMontage(user, chatId, fixText) {
     await saveUser(user);
     await say('📤 Отправляю ролик…');
     await sendVideoFile(chatId, path.join(projDir(user), res.file), { caption: resultCaption(p, res.subsNote), width: res.width, height: res.height, duration: Math.round(res.duration), reply_markup: resultKb(p) });
-    await tg('deleteMessage', { chat_id: chatId, message_id: st.message_id }).catch(() => {});
+    await st.done(null);
   } catch (e) {
-    await say(`⚠️ ${fixText ? 'Правку внести' : 'Смонтировать'} не получилось: ${esc(e.message)}`);
+    await st.done(`⚠️ ${fixText ? 'Правку внести' : 'Смонтировать'} не получилось: ${esc(e.message)}`, fixText ? {} : { reply_markup: kb([[['🔁 Попробовать ещё раз', 'm_go']]]) });
     log('montage:', e.stack || e.message);
   }
 }
@@ -1776,10 +2212,8 @@ async function onMessage(msg) {
       await send(chatId, `Примеров уже ${CFG.maxExamples} — этого более чем достаточно. Лишние можно убрать командой /del.`);
       return;
     }
-    enqueue(user, chatId, async () => {
-      await processExample(user, chatId, m);
-      await afterExamples(user, chatId);
-    });
+    addInbox(user, 'example', m);
+    queueExample(user, chatId, m);
     return;
   }
 
@@ -1873,7 +2307,7 @@ async function onMessage(msg) {
 }
 
 const BUSY = 'Подождите, я ещё обрабатываю прошлые файлы — нажмите ещё раз, когда закончу.';
-const busy = (user) => (pending.get(user.id) || 0) > 0;
+const busy = (user) => isBusy(user);
 
 /** Видео или звук в режиме монтажа */
 async function onSourceMedia(user, chatId, m) {
@@ -1891,10 +2325,23 @@ async function onSourceMedia(user, chatId, m) {
   if (p.sources.length + (pending.get(user.id) || 0) >= CFG.maxSources) {
     return void (await send(chatId, `Исходников уже ${CFG.maxSources}. Лишние можно убрать командой /del.`));
   }
+  if (!(user.inbox || []).some((x) => x.m.fileId === m.fileId)) addInbox(user, 'source', m);
+  p.summarySig = '';
+  queueSource(user, chatId, m);
+}
+
+function queueSource(user, chatId, m) {
+  const p = user.project || newProject(user);
   enqueue(user, chatId, async () => {
-    if (user.project !== p) return;
+    if (user.project !== p) return dropInbox(user, m);
     await processSource(user, chatId, m);
-    await afterSources(user, chatId);
+  }).then(() => setTimeout(() => afterSources(user, chatId).catch(() => {}), 50));
+}
+
+function queueExample(user, chatId, m) {
+  enqueue(user, chatId, async () => {
+    await processExample(user, chatId, m);
+    await afterExamples(user, chatId);
   });
 }
 
@@ -2056,6 +2503,46 @@ async function startLocalBotApi() {
   throw new Error('Сервер Bot API не отвечает');
 }
 
+/** После перезапуска сервера: честно отмечаем прерванное и продолжаем с того места, где остановились */
+async function recover() {
+  let ids = [];
+  try {
+    ids = await fsp.readdir(path.join(CFG.dataDir, 'users'));
+  } catch (_) {
+    return;
+  }
+  for (const id of ids) {
+    if (!/^\d+$/.test(id)) continue;
+    const user = await getUser(id);
+    const chatId = Number(id);
+    const live = user.live || [];
+    for (const l of live) await edit(l.chatId, l.id, `${esc(String(l.text || '').replace(/…$/, ''))} — ⚠️ прервалось: сервер перезапускался.`);
+    const wasMontage = live.some((l) => /монтаж|правку/i.test(l.text || ''));
+    user.live = [];
+    const inbox = user.inbox || [];
+    const p = user.project;
+    const unfinished = p ? p.sources.filter((s) => needsAnalysis(user, s)) : [];
+    await saveUser(user);
+    if (!inbox.length && !unfinished.length && !wasMontage) continue;
+    const parts = ['♻️ Бот перезапускался.'];
+    if (inbox.length) parts.push(`Продолжаю приём файлов: ${inbox.length}.`);
+    if (unfinished.length) parts.push(`Доразбираю исходники: ${unfinished.length}.`);
+    if (wasMontage) parts.push('Монтаж прервался — запустите его ещё раз.');
+    await send(chatId, parts.join(' '), wasMontage ? { reply_markup: kb([[['🎬 Смонтировать', 'm_go']]]) } : {}).catch(() => {});
+    log(`recover ${id}: файлов ${inbox.length}, разборов ${unfinished.length}, монтаж ${wasMontage}`);
+    for (const x of inbox) (x.type === 'source' ? queueSource : queueExample)(user, chatId, x.m);
+    for (const s of unfinished) {
+      background(user, chatId, async () => {
+        try {
+          await analyzePatiently(user, s, async () => {});
+        } catch (e) {
+          s.aiError = e.message;
+        }
+      }).then(() => setTimeout(() => afterSources(user, chatId).catch(() => {}), 50));
+    }
+  }
+}
+
 async function pollLoop() {
   let offset = 0;
   for (;;) {
@@ -2095,6 +2582,7 @@ async function main() {
   }).catch(() => {});
   // Railway может ждать ответа на порту — отвечаем «жив»
   if (process.env.PORT) http.createServer((_, res) => res.end('ok')).listen(Number(process.env.PORT));
+  await recover().catch((e) => log('recover:', e.message));
   log(`Бот @${me.username} запущен. Свой сервер Bot API: ${LOCAL_MODE ? 'да' : 'нет'}. Данные: ${CFG.dataDir}. Модель: ${CFG.geminiModel}`);
   await pollLoop();
 }
